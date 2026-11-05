@@ -353,6 +353,9 @@ proc getColumnsHorizon(overseer: SyncOverseerRef2, currentEpoch: Epoch): Epoch =
   else:
     tempEpoch
 
+proc getColumnsHorizon(overseer: SyncOverseerRef2): Epoch =
+  overseer.getColumnsHorizon(overseer.beaconClock.currentSlot().epoch())
+
 proc shouldGetColumns(
     overseer: SyncOverseerRef2, slot: Slot, currentEpoch: Epoch): bool =
   if overseer.config.historyMode == HistoryMode.ColumnArchive:
