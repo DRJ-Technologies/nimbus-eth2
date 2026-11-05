@@ -620,18 +620,23 @@ proc addBackfillExecutionPayload*(
     bidBuilderIdx = signedBlock.message.body.signed_execution_payload_bid.
       message.builder_index
 
-  # Verify signature
+  # Verify signature. Only a later external-builder assignment makes the
+  # current key insufficient for judging this historical signature.
+  var signatureFailure = PayloadVerifierError.Invalid
   let builderKey =
     withState(dag.headState):
       when consensusFork >= ConsensusFork.Gloas:
         if bidBuilderIdx == BUILDER_INDEX_SELF_BUILD:
           if uint64(builderIdx) >= forkyState.data.validators.lenu64:
-            return err(PayloadVerifierError.LocalVerification)
+            return err(PayloadVerifierError.Invalid)
           forkyState.data.validators.item(builderIdx).pubkey
         else:
           if bidBuilderIdx >= forkyState.data.builders.lenu64:
             return err(PayloadVerifierError.LocalVerification)
-          forkyState.data.builders.item(bidBuilderIdx).pubkey
+          let builder = forkyState.data.builders.item(bidBuilderIdx)
+          if builder.deposit_epoch > envelope.slot.epoch:
+            signatureFailure = PayloadVerifierError.LocalVerification
+          builder.pubkey
       else:
         return err(PayloadVerifierError.LocalVerification)
   if not verify_execution_payload_envelope_signature(
@@ -641,9 +646,7 @@ proc addBackfillExecutionPayload*(
       envelope,
       builderKey,
       signedEnvelope.signature):
-    # A head-state builder index may have been reused since this slot. This
-    # local key cannot establish historical authority; never blame the peer.
-    return err(PayloadVerifierError.LocalVerification)
+    return err(signatureFailure)
   let sigVerifyTick = Moment.now
 
   if dag.db.containsExecutionPayloadEnvelope(blockRoot):

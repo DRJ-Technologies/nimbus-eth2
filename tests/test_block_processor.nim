@@ -870,8 +870,24 @@ suite "Block processor" & preset():
             res.isErr
             db.containsExecutionPayloadEnvelope(bid.root) == envelopePresent
             not db.containsDataColumnSidecar(ConsensusFork.Gloas, bid.root, ColumnIndex(0))
+          if kind == 3:
+            check res.isErr and res.error == PayloadVerifierError.Invalid
           if envelopePresent:
             check SSZ.encode(db.getExecutionPayloadEnvelope(bid.root).get()) == saved
+
+  asyncTest "Finalized Gloas self-build bad signature is Invalid before Duplicate" & preset():
+    finalizedColumnsFixture:
+      var bad = copyFixture(engine.envelope)
+      bad.signature = default(ValidatorSig)
+      for envelopePresent in [false, true]:
+        if envelopePresent:
+          require dag.addBackfillExecutionPayload(engine.envelope).isOk
+        let res = await processor.addPayload(
+          engine.blck, bad, Opt.some(columns[0..0]))
+        check:
+          res.isErr and res.error == PayloadVerifierError.Invalid
+          db.containsExecutionPayloadEnvelope(bid.root) == envelopePresent
+          not db.containsDataColumnSidecar(ConsensusFork.Gloas, bid.root, ColumnIndex(0))
 
   asyncTest "Finalized Gloas missed slot alias is refused exactly" & preset():
     finalizedColumnsFixture:
@@ -929,7 +945,7 @@ suite "Block processor" & preset():
       require db.getDataColumnSidecar(bid.root, ColumnIndex(1), stored)
       check SSZ.encode(stored) == savedColumn
 
-  asyncTest "Finalized Gloas reused head builder key refuses locally before Duplicate" & preset():
+  asyncTest "Finalized Gloas builder signature refusal obeys strict reassignment epoch" & preset():
     finalizedColumnsFixture:
       # Model a stored finalized external-builder block with native signatures.
       # This fixture targets historical import, not a replayed finality chain.
@@ -957,9 +973,27 @@ suite "Block processor" & preset():
       envelope.signature = get_execution_payload_envelope_signature(
         forkyState.data.fork, dag.genesis_validators_root,
         bid.slot.epoch, envelope.message, MockPrivKeys[0'u64]).toValidatorSig()
-      require dag.addBackfillExecutionPayload(envelope).isOk
+      var bad = copyFixture(envelope)
+      bad.signature = default(ValidatorSig)
+      for envelopePresent in [false, true]:
+        if envelopePresent:
+          require dag.addBackfillExecutionPayload(envelope).isOk
+        let before =
+          if envelopePresent: SSZ.encode(db.getExecutionPayloadEnvelope(historical.root).get())
+          else: newSeq[byte]()
+        for assignedEpoch in [Epoch(0), envelope.message.slot.epoch - 1,
+                              envelope.message.slot.epoch]:
+          dag.headState.gloasData.data.builders.mitem(BuilderIndex(0)).deposit_epoch = assignedEpoch
+          let invalid = dag.addBackfillExecutionPayload(bad)
+          check:
+            invalid.isErr and invalid.error == PayloadVerifierError.Invalid
+            db.containsExecutionPayloadEnvelope(historical.root) == envelopePresent
+          if envelopePresent:
+            check SSZ.encode(db.getExecutionPayloadEnvelope(historical.root).get()) == before
       let saved = SSZ.encode(db.getExecutionPayloadEnvelope(historical.root).get())
+      # Native index reassignment installs both the new key and its epoch.
       dag.headState.gloasData.data.builders.mitem(BuilderIndex(0)).pubkey = MockPubKeys[1'u64]
+      dag.headState.gloasData.data.builders.mitem(BuilderIndex(0)).deposit_epoch = envelope.message.slot.epoch + 1
       let refused = dag.addBackfillExecutionPayload(envelope)
       check:
         refused.isErr and refused.error == PayloadVerifierError.LocalVerification
