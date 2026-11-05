@@ -10,6 +10,7 @@
 
 import
   chronos,
+  ssz_serialization,
   unittest2,
   taskpools,
   kzg4844 as kzg,
@@ -58,6 +59,12 @@ func createValidKzgBlob(): kzg.KzgBlob =
 proc pruneAtFinalization(dag: ChainDAGRef) =
   if dag.needStateCachesAndForkChoicePruning():
     dag.pruneStateCachesDAG()
+
+proc copyFixture[T](value: T): T =
+  try:
+    SSZ.decode(SSZ.encode(value), T)
+  except SerializationError:
+    raiseAssert "generated fixture must round trip"
 
 suite "Block processor" & preset():
   setup:
@@ -743,6 +750,219 @@ suite "Block processor" & preset():
     let res4 = await processor2.addBlock(
       MsgSource.gossip, b4, noSidecars)
     check res4.isOk
+
+
+  template finalizedColumnsFixture(body: untyped) {.dirty.} =
+    process_slots(cfg, state[], start_slot(cfg.GLOAS_FORK_EPOCH),
+      cache, info, {}).expect("Gloas fixture")
+    let processor {.inject.} = BlockProcessor.new(
+      false, "", "", batchVerifier, consensusManager, validatorMonitor,
+      dataColumnQuarantine, gloasColumnQuarantine, envelopeQuarantine, getTimeFn)
+    withState(state[]):
+      when consensusFork == ConsensusFork.Gloas:
+        let
+          blob = createValidKzgBlob()
+          commitment = kzg.blobToKzgCommitment(blob).expect("fixture commitment")
+          cellsAndProofs = kzg.computeCellsAndKzgProofs(blob).expect("fixture cells")
+          proofs = cellsAndProofs.proofs.mapIt(kzg.KzgProof(it))
+          bundle = testblockutil.BlobsBundle(
+            commitments: @[commitment], proofs: proofs, blobs: @[blob.bytes])
+          engine {.inject.} = addTestEngineBlock(
+            cfg, ConsensusFork.Gloas, forkyState, cache, blobs_bundle = bundle)
+          columns {.inject.} = assemble_data_column_sidecars(
+            engine.blck, @[blob], proofs, supernodeMap)
+          bid {.inject.} = engine.blck.toBlockId()
+        require columns.len == NUMBER_OF_COLUMNS.int
+        require (await processor.addBlock(
+          MsgSource.sync, engine.blck, noSidecars)).isOk
+        dag.updateHead(dag.getBlockRef(bid.root).get(), quarantine[], [])
+        # Unit fixture finality boundary: the block itself passed native import.
+        # This models finalized import without a network/finality simulation.
+        dag.finalizedHead = BlockSlot(blck: dag.head, slot: bid.slot)
+        body
+
+  asyncTest "Finalized Gloas duplicate envelope repairs columns after envelope-only commit" & preset():
+    finalizedColumnsFixture:
+      var wakes: seq[Slot]
+      processor.onDataColumnsStored = proc(slot: Slot) = wakes.add(slot)
+      require (await processor.addPayload(
+        engine.blck, engine.envelope, Opt.none(gloas.DataColumnSidecars))).isOk
+      let saved = SSZ.encode(db.getExecutionPayloadEnvelope(bid.root).get())
+      check not db.containsDataColumnSidecar(ConsensusFork.Gloas, bid.root, ColumnIndex(0))
+      check (await processor.addPayload(engine.blck, engine.envelope,
+        Opt.some(columns[0..0]))).isOk
+      check:
+        db.containsDataColumnSidecar(ConsensusFork.Gloas, bid.root, ColumnIndex(0))
+        SSZ.encode(db.getExecutionPayloadEnvelope(bid.root).get()) == saved
+        wakes == @[bid.slot]
+      let repeat = await processor.addPayload(
+        engine.blck, engine.envelope, Opt.some(columns[0..0]))
+      check repeat.isErr and repeat.error == PayloadVerifierError.Duplicate
+      check wakes == @[bid.slot]
+
+  for envelopePresent in [false, true]:
+    asyncTest "Finalized Gloas column DB accumulates below quorum E=" & $envelopePresent & preset():
+      finalizedColumnsFixture:
+        if envelopePresent:
+          require (await processor.addPayload(engine.blck, engine.envelope,
+            Opt.none(gloas.DataColumnSidecars))).isOk
+        var wakes: seq[Slot]
+        processor.onDataColumnsStored = proc(slot: Slot) = wakes.add(slot)
+        for limits in [(0, 0), (1, 62), (63, 63), (64, 126), (127, 127)]:
+          require processor.addBackfillSidecars(bid, columns[limits[0]..limits[1]]).isOk
+          for i in 0..limits[1]:
+            check db.containsDataColumnSidecar(ConsensusFork.Gloas, bid.root, ColumnIndex(i))
+          check db.containsExecutionPayloadEnvelope(bid.root) == envelopePresent
+          # Quarantine finalization cannot discard already committed DB columns.
+          gloasColumnQuarantine[].pruneAfterFinalization(
+            bid.slot.epoch + 1, Opt.none(Slot))
+        let before = wakes.len
+        check processor.addBackfillSidecars(bid, columns).isOk
+        check wakes.len == before
+        for wake in wakes:
+          check wake == bid.slot
+
+  asyncTest "Finalized Gloas invalid column batch has zero writes or wakeup" & preset():
+    finalizedColumnsFixture:
+      var wakes: seq[Slot]
+      processor.onDataColumnsStored = proc(slot: Slot) = wakes.add(slot)
+      for kind in 0..6:
+        var bad = newClone(copyFixture(columns[1][]))
+        case kind
+        of 0: bad.slot = bid.slot + 1
+        of 1: bad.beacon_block_root = ZERO_HASH
+        of 2: bad.index = ColumnIndex(NUMBER_OF_COLUMNS)
+        of 3: bad.column.setLen(0)
+        of 4: bad.kzg_proofs[0] = default(typeof(bad.kzg_proofs[0]))
+        of 5: bad = columns[0] # duplicate index
+        else: bad = nil
+        let batch = @[columns[0], bad]
+        let res = processor.addBackfillSidecars(bid, batch)
+        check res.isErr
+        check (await processor.addPayload(engine.blck, engine.envelope,
+          Opt.some(batch))).isErr
+        check:
+          not db.containsDataColumnSidecar(ConsensusFork.Gloas, bid.root, ColumnIndex(0))
+          not db.containsExecutionPayloadEnvelope(bid.root)
+          wakes.len == 0
+
+  for envelopePresent in [false, true]:
+    asyncTest "Finalized Gloas invalid envelope zero writes E=" & $envelopePresent & preset():
+      finalizedColumnsFixture:
+        if envelopePresent:
+          require (await processor.addPayload(engine.blck, engine.envelope,
+            Opt.none(gloas.DataColumnSidecars))).isOk
+        let saved =
+          if envelopePresent: SSZ.encode(db.getExecutionPayloadEnvelope(bid.root).get())
+          else: newSeq[byte]()
+        for kind in 0..6:
+          var bad = copyFixture(engine.envelope)
+          case kind
+          of 0: bad.message.payload.block_hash = ZERO_HASH
+          of 1: bad.message.payload.gas_used += 1
+          of 2: bad.message.builder_index = BuilderIndex(0)
+          of 3: bad.signature = default(ValidatorSig)
+          of 4: bad.message.beacon_block_root = ZERO_HASH
+          of 5: bad.message.payload.transactions[0].setLen(0)
+          else: bad.message.parent_beacon_block_root = ZERO_HASH
+          let res = await processor.addPayload(engine.blck, bad, Opt.some(columns[0..0]))
+          check:
+            res.isErr
+            db.containsExecutionPayloadEnvelope(bid.root) == envelopePresent
+            not db.containsDataColumnSidecar(ConsensusFork.Gloas, bid.root, ColumnIndex(0))
+          if envelopePresent:
+            check SSZ.encode(db.getExecutionPayloadEnvelope(bid.root).get()) == saved
+
+  asyncTest "Finalized Gloas missed slot alias is refused exactly" & preset():
+    finalizedColumnsFixture:
+      dag.finalizedHead.slot = bid.slot + 1
+      var bad = copyFixture(engine.envelope)
+      bad.message.payload.slot_number = bid.slot + 1
+      check dag.addBackfillExecutionPayload(bad).isErr
+      check processor.addBackfillSidecars(
+        BlockId(root: bid.root, slot: bid.slot + 1), columns[0..0]).isErr
+      check:
+        not db.containsExecutionPayloadEnvelope(bid.root)
+        not db.containsDataColumnSidecar(ConsensusFork.Gloas, bid.root, ColumnIndex(0))
+
+  asyncTest "Finalized Gloas mismatched canonical block-envelope pair has zero writes" & preset():
+    finalizedColumnsFixture:
+      let other = addTestEngineBlock(cfg, ConsensusFork.Gloas, forkyState,
+        cache, blobs_bundle = engine.blobsBundle)
+      require (await processor.addBlock(MsgSource.sync, other.blck, noSidecars)).isOk
+      dag.updateHead(dag.getBlockRef(other.blck.root).get(), quarantine[], [])
+      dag.finalizedHead = BlockSlot(blck: dag.head, slot: other.blck.message.slot)
+      let mismatch = await processor.addPayload(
+        engine.blck, other.envelope, Opt.some(columns[0..0]))
+      check:
+        mismatch.isErr
+        not db.containsExecutionPayloadEnvelope(other.blck.root)
+        not db.containsExecutionPayloadEnvelope(bid.root)
+        not db.containsDataColumnSidecar(ConsensusFork.Gloas, bid.root, ColumnIndex(0))
+      # The rejected envelope is valid for its OWN canonical block.
+      check dag.addBackfillExecutionPayload(other.envelope).isOk
+
+  asyncTest "Finalized Gloas conflicting stored envelope and columns are preserved" & preset():
+    finalizedColumnsFixture:
+      var conflicting = copyFixture(engine.envelope)
+      conflicting.message.payload.gas_used += 1
+      db.putExecutionPayloadEnvelope(conflicting)
+      let saved = SSZ.encode(db.getExecutionPayloadEnvelope(bid.root).get())
+      let res = await processor.addPayload(engine.blck, engine.envelope, Opt.some(columns[0..0]))
+      check:
+        res.isErr and res.error == PayloadVerifierError.LocalVerification
+        SSZ.encode(db.getExecutionPayloadEnvelope(bid.root).get()) == saved
+        not db.containsDataColumnSidecar(ConsensusFork.Gloas, bid.root, ColumnIndex(0))
+      # Independent valid column repair does not need the conflicting envelope.
+      check processor.addBackfillSidecars(bid, columns[0..0]).isOk
+      var conflictColumn = newClone(copyFixture(columns[1][]))
+      conflictColumn.slot = bid.slot + 1
+      db.putDataColumnSidecars(@[conflictColumn])
+      var stored: gloas.DataColumnSidecar
+      require db.getDataColumnSidecar(bid.root, ColumnIndex(1), stored)
+      let savedColumn = SSZ.encode(stored)
+      let cres = processor.addBackfillSidecars(bid, @[columns[2], columns[1]])
+      check:
+        cres.isErr and cres.error == PayloadVerifierError.LocalVerification
+        not db.containsDataColumnSidecar(ConsensusFork.Gloas, bid.root, ColumnIndex(2))
+      require db.getDataColumnSidecar(bid.root, ColumnIndex(1), stored)
+      check SSZ.encode(stored) == savedColumn
+
+  asyncTest "Finalized Gloas reused head builder key refuses locally before Duplicate" & preset():
+    finalizedColumnsFixture:
+      # Model a stored finalized external-builder block with native signatures.
+      # This fixture targets historical import, not a replayed finality chain.
+      var historical = copyFixture(engine.blck)
+      historical.message.body.signed_execution_payload_bid.message.builder_index = BuilderIndex(0)
+      historical.message.body.signed_execution_payload_bid.signature =
+        get_execution_payload_bid_signature(forkyState.data.fork,
+          dag.genesis_validators_root, bid.slot.epoch,
+          historical.message.body.signed_execution_payload_bid.message,
+          MockPrivKeys[0'u64]).toValidatorSig()
+      historical.root = hash_tree_root(historical.message)
+      historical.signature = get_block_signature(forkyState.data.fork,
+        dag.genesis_validators_root, bid.slot, historical.root,
+        MockPrivKeys[historical.message.proposer_index]).toValidatorSig()
+      let forkedHistorical = ForkedSignedBeaconBlock.init(historical)
+      db.putBlock(forkedHistorical.asTrusted().gloasData)
+      dag.head = BlockRef.init(historical.root, OptimisticStatus.valid, historical.message)
+      dag.finalizedHead = BlockSlot(blck: dag.head, slot: bid.slot)
+      dag.headState.gloasData.data.builders.add(gloas.Builder(
+        pubkey: MockPubKeys[0'u64], version: PAYLOAD_BUILDER_VERSION,
+        withdrawable_epoch: FAR_FUTURE_EPOCH))
+      var envelope = copyFixture(engine.envelope)
+      envelope.message.builder_index = BuilderIndex(0)
+      envelope.message.beacon_block_root = historical.root
+      envelope.signature = get_execution_payload_envelope_signature(
+        forkyState.data.fork, dag.genesis_validators_root,
+        bid.slot.epoch, envelope.message, MockPrivKeys[0'u64]).toValidatorSig()
+      require dag.addBackfillExecutionPayload(envelope).isOk
+      let saved = SSZ.encode(db.getExecutionPayloadEnvelope(historical.root).get())
+      dag.headState.gloasData.data.builders.mitem(BuilderIndex(0)).pubkey = MockPubKeys[1'u64]
+      let refused = dag.addBackfillExecutionPayload(envelope)
+      check:
+        refused.isErr and refused.error == PayloadVerifierError.LocalVerification
+        SSZ.encode(db.getExecutionPayloadEnvelope(historical.root).get()) == saved
 
 # Clean up KZG trusted setup at the end of all tests
 doAssert kzg.freeTrustedSetup().isOk

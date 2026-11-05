@@ -11,7 +11,7 @@ import
   chronicles,
   results,
   ../spec/[
-    beaconstate, forks, signatures, signatures_batch,
+    beaconstate, forks, helpers_el, signatures, signatures_batch,
     state_transition, state_transition_epoch],
   ./[block_pools_types, block_dag, blockchain_dag,
        blockchain_dag_light_client, block_quarantine]
@@ -492,6 +492,16 @@ proc addBackfillBlock*(
 
   ok()
 
+func matchesPayloadBlock*(
+    signedBlock: gloas.SignedBeaconBlock,
+    signedEnvelope: gloas.SignedExecutionPayloadEnvelope): bool =
+  template bid(): auto =
+    signedBlock.message.body.signed_execution_payload_bid.message
+  signedBlock.message.slot == signedEnvelope.message.slot and
+    signedBlock.root == signedEnvelope.message.beacon_block_root and
+    bid.builder_index == signedEnvelope.message.builder_index and
+    bid.block_hash == signedEnvelope.message.payload.block_hash
+
 proc addHeadExecutionPayload*(
     dag: ChainDAGRef,
     signedBlock: gloas.SignedBeaconBlock,
@@ -513,15 +523,7 @@ proc addHeadExecutionPayload*(
 
   const consensusFork = typeof(signedBlock).kind
 
-  # Quick check between the received block and envelope.
-  template bid(): auto =
-    signedBlock.message.body.signed_execution_payload_bid.message
-  if not (
-    signedBlock.message.slot == envelopeSlot and
-    signedBlock.root == envelopeBlockRoot and
-    bid.builder_index == signedEnvelope.message.builder_index and
-    bid.block_hash == signedEnvelope.message.payload.block_hash
-  ):
+  if not matchesPayloadBlock(signedBlock, signedEnvelope):
     info "Envelope mismatches with this block"
     return err(PayloadVerifierError.Invalid)
 
@@ -575,6 +577,24 @@ proc addHeadExecutionPayload*(
 
   ok(blck)
 
+proc getBackfillPayloadBlock*(
+    dag: ChainDAGRef, root: Eth2Digest, slot: Slot
+): Result[gloas.SignedBeaconBlock, PayloadVerifierError] =
+  if slot > dag.finalizedHead.slot:
+    return err(PayloadVerifierError.Invalid)
+  let bsi = dag.getBlockIdAtSlot(slot).valueOr:
+    return err(PayloadVerifierError.Invalid)
+  if not bsi.isProposed() or bsi.bid.slot != slot or bsi.bid.root != root:
+    return err(PayloadVerifierError.Invalid)
+  let stored = dag.getForkedBlock(bsi.bid).valueOr:
+    return err(PayloadVerifierError.LocalVerification)
+  if stored.kind != ConsensusFork.Gloas:
+    return err(PayloadVerifierError.UnviableFork)
+  let signedBlock = stored.asSigned().gloasData
+  if signedBlock.root != root or signedBlock.message.slot != slot:
+    return err(PayloadVerifierError.LocalVerification)
+  ok(signedBlock)
+
 proc addBackfillExecutionPayload*(
     dag: ChainDAGRef,
     signedEnvelope: gloas.SignedExecutionPayloadEnvelope,
@@ -590,51 +610,30 @@ proc addBackfillExecutionPayload*(
 
   let startTick = Moment.now()
 
-  # When a valid block is backfilled, dag.backfill has already moved to next
-  # parent. So we need to check with finalizedHead and database.
-  if envelope.slot > dag.finalizedHead.slot:
+  let signedBlock = ?dag.getBackfillPayloadBlock(blockRoot, envelope.slot)
+  if not matchesPayloadBlock(signedBlock, signedEnvelope):
     return err(PayloadVerifierError.Invalid)
-
-  # Check root and slot of the block
-  let bsi = dag.getBlockIdAtSlot(envelope.slot).valueOr:
-    # This should not be happening as we backfill envelope after the block is
-    # backfilled successfully.
+  verifyPayloadOnCL(signedBlock, signedEnvelope).isOkOr:
     return err(PayloadVerifierError.Invalid)
-  if blockRoot != bsi.bid.root:
-    return err(PayloadVerifierError.Invalid)
-  if dag.db.containsExecutionPayloadEnvelope(blockRoot):
-    return err(PayloadVerifierError.Duplicate)
-
-  let (builderIdx, bidBuilderIdx) = block:
-    let forkedBlck = dag.getForkedBlock(bsi.bid).valueOr:
-      # The block should exist as we have checked above. Database may be
-      # corrupted.
-      debug "Backfill envelope cannot find forked block, database corrupt?"
-      return err(PayloadVerifierError.Invalid)
-    withBlck(forkedBlck):
-      when consensusFork >= ConsensusFork.Gloas:
-        template bid(): auto =
-          forkyBlck.message.body.signed_execution_payload_bid
-        (forkyBlck.builder_index, bid.message.builder_index)
-      else:
-        return err(PayloadVerifierError.UnviableFork)
-
-  # Check builder index is matched with the block
-  if bidBuilderIdx != envelope.builder_index:
-    return err(PayloadVerifierError.Invalid)
+  let
+    builderIdx = signedBlock.message.proposer_index
+    bidBuilderIdx = signedBlock.message.body.signed_execution_payload_bid.
+      message.builder_index
 
   # Verify signature
   let builderKey =
     withState(dag.headState):
       when consensusFork >= ConsensusFork.Gloas:
         if bidBuilderIdx == BUILDER_INDEX_SELF_BUILD:
+          if uint64(builderIdx) >= forkyState.data.validators.lenu64:
+            return err(PayloadVerifierError.LocalVerification)
           forkyState.data.validators.item(builderIdx).pubkey
         else:
           if bidBuilderIdx >= forkyState.data.builders.lenu64:
-            return err(PayloadVerifierError.Invalid)
+            return err(PayloadVerifierError.LocalVerification)
           forkyState.data.builders.item(bidBuilderIdx).pubkey
       else:
-        return err(PayloadVerifierError.UnviableFork)
+        return err(PayloadVerifierError.LocalVerification)
   if not verify_execution_payload_envelope_signature(
       dag.forkAtEpoch(envelope.slot.epoch),
       dag.genesis_validators_root,
@@ -642,8 +641,17 @@ proc addBackfillExecutionPayload*(
       envelope,
       builderKey,
       signedEnvelope.signature):
-    return err(PayloadVerifierError.Invalid)
+    # A head-state builder index may have been reused since this slot. This
+    # local key cannot establish historical authority; never blame the peer.
+    return err(PayloadVerifierError.LocalVerification)
   let sigVerifyTick = Moment.now
+
+  if dag.db.containsExecutionPayloadEnvelope(blockRoot):
+    let stored = dag.db.getExecutionPayloadEnvelope(blockRoot).valueOr:
+      return err(PayloadVerifierError.LocalVerification)
+    if hash_tree_root(stored) != hash_tree_root(signedEnvelope):
+      return err(PayloadVerifierError.LocalVerification)
+    return err(PayloadVerifierError.Duplicate)
 
   dag.db.putExecutionPayloadEnvelope(signedEnvelope)
   let putBlockTick = Moment.now

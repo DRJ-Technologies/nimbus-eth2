@@ -8,7 +8,7 @@
 {.push raises: [], gcsafe.}
 
 import
-  std/typetraits,
+  std/[typetraits, sequtils],
   eth/common/eth_types_rlp,
   ./[helpers, state_transition_block]
 
@@ -77,3 +77,51 @@ func is_valid_versioned_hashes*(
           gloas.BeaconBlock,
 ): Result[void, string] =
   is_valid_versioned_hashes(blck, noEnvelope)
+
+proc verifyPayloadOnCL*(
+    signedBlock: bellatrix.SignedBeaconBlock | capella.SignedBeaconBlock |
+                 deneb.SignedBeaconBlock | electra.SignedBeaconBlock |
+                 fulu.SignedBeaconBlock | gloas.SignedBeaconBlock |
+                 heze.SignedBeaconBlock,
+    signedEnvelope: NoEnvelope | gloas.SignedExecutionPayloadEnvelope):
+    Result[void, string] =
+  const consensusFork = typeof(signedBlock).kind
+  # When the execution layer is not available to verify the payload, we do the
+  # required checks on the CL instead and proceed as if the EL was syncing
+  # https://github.com/ethereum/consensus-specs/blob/v1.6.0-alpha.6/specs/bellatrix/beacon-chain.md#verify_and_notify_new_payload
+  # https://github.com/ethereum/consensus-specs/blob/v1.6.0-alpha.6/specs/deneb/beacon-chain.md#modified-verify_and_notify_new_payload
+
+  template payload(): auto =
+    when consensusFork >= ConsensusFork.Gloas:
+      signedEnvelope.message.payload
+    else:
+      signedBlock.message.body.execution_payload
+
+  if payload.transactions.anyIt(it.len == 0):
+    return err("Execution block contains zero length transactions")
+
+  template computedBlockHash(): auto =
+    when consensusFork >= ConsensusFork.Gloas:
+      signedEnvelope.message.compute_execution_block_hash()
+    else:
+      signedBlock.message.compute_execution_block_hash()
+  if payload.block_hash != computedBlockHash:
+    return err("Execution block hash validation failed")
+
+  # [New in Deneb:EIP4844]
+  when consensusFork >= ConsensusFork.Deneb:
+    let blobsRes =
+      when consensusFork >= ConsensusFork.Gloas:
+        signedBlock.message.is_valid_versioned_hashes(signedEnvelope.message)
+      else:
+        signedBlock.message.is_valid_versioned_hashes()
+    if blobsRes.isErr:
+      return err("Blob versioned hashes invalid, reason:" & $blobsRes.error)
+  else:
+    # If there are EIP-4844 (type 3) transactions in the payload with
+    # versioned hashes, the transactions would be rejected by the EL
+    # based on payload timestamp (only allowed post Deneb);
+    # There are no `blob_kzg_commitments` before Deneb to compare against
+    discard
+
+  ok()

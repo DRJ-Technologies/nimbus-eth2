@@ -294,6 +294,32 @@ proc setupColumnsVerifier(
   (quarantine, collector2(aq), verifier2(aq))
 
 suite "SyncManager test suite":
+  asyncTest "[SyncQueue] local verification refusal has no peer penalty or rewind":
+    check toSyncVerifierError(PayloadVerifierError.LocalVerification) ==
+      SyncVerifierError.LocalVerification
+    for kind in [SyncQueueKind.Forward, SyncQueueKind.Backward]:
+      let
+        first = if kind == SyncQueueKind.Forward: Slot(1) else: Slot(2)
+        finish = if kind == SyncQueueKind.Forward: Slot(3) else: Slot(0)
+        peer = SomeTPeer.init("local-refusal")
+      proc refuse(item: SyncResponseItem, maybeFinalized: bool):
+          Future[Result[void, SyncVerifierError]] {.async: (raises: [CancelledError]).} =
+        return err(SyncVerifierError.LocalVerification)
+      let sq = SyncQueue.init(SomeTPeer, BlockCompleteness, kind, first, finish,
+        1'u64, 3, 1, getStaticSlotCb(first), refuse,
+        testforkAtEpoch, getManyPeersCount)
+      let score = peer.score
+      for attempt in 0..2:
+        let req = sq.pop(Slot(3), peer)
+        check req.data.slot == first
+        let reply = await sq.push(req, createChain(req.data))
+        check:
+          reply.code == SyncProcessError.LocalVerification
+          reply.count == 0
+          peer.score == score
+          sq.inpSlot == first
+          sq.outSlot == first
+
   for kind in [SyncQueueKind.Forward, SyncQueueKind.Backward]:
     asyncTest "[SyncQueue#" & $kind & "] column completeness request limit test":
       let

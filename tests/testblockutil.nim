@@ -336,6 +336,7 @@ proc addTestEngineBlock*(
         gloas.SignedExecutionPayloadBid(
           message: gloas.ExecutionPayloadBid(
             builder_index: BUILDER_INDEX_SELF_BUILD,
+            blob_kzg_commitments: gloas.KzgCommitments(blobs_bundle.commitments),
             slot: state.data.slot,
             block_hash: eps.executionPayload.block_hash,
             parent_block_hash: eps.executionPayload.parent_hash,

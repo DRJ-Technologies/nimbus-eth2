@@ -9,7 +9,7 @@
 {.used.}
 
 import
-  unittest2,
+  unittest2, std/[os, tempfiles],
   ../beacon_chain/[beacon_chain_db, beacon_chain_db_quarantine],
   ../beacon_chain/consensus_object_pools/block_dag,
   ../beacon_chain/spec/forks,
@@ -947,6 +947,48 @@ suite "Beacon chain DB" & preset():
       not db.getExecutionPayloadEnvelopeSZ(blockRoot1, data)
 
     db.close()
+
+  test "Gloas envelope commit and column rollback survive native DB reopen" & preset():
+    var localCfg = cfg
+    localCfg.GLOAS_FORK_EPOCH = Epoch(0)
+    localCfg.FULU_FORK_EPOCH = Epoch(0)
+    let directory = createTempDir("nimbus-backfill-", "")
+    defer:
+      try: removeDir(directory)
+      except OSError: discard
+    let
+      root = hash_tree_root(BeaconBlockHeader(slot: Slot(7)))
+      envelope = gloas.SignedExecutionPayloadEnvelope(
+        message: gloas.ExecutionPayloadEnvelope(beacon_block_root: root))
+      column = newClone(gloas.DataColumnSidecar(
+        beacon_block_root: root, slot: Slot(7), index: ColumnIndex(0)))
+    var local = BeaconChainDB.new(directory, localCfg)
+    local.putExecutionPayloadEnvelope(envelope)
+    local.close()
+    local = BeaconChainDB.new(directory, localCfg)
+    check:
+      local.containsExecutionPayloadEnvelope(root)
+      not local.containsDataColumnSidecar(ConsensusFork.Gloas, root, ColumnIndex(0))
+    # Inject unwinding, not an expectDb failure: production DB errors panic.
+    expect IOError:
+      local.withManyWrites:
+        local.putDataColumnSidecars(@[column])
+        if local.containsDataColumnSidecar(ConsensusFork.Gloas, root, ColumnIndex(0)):
+          raise newException(IOError, "injected transaction unwind")
+    local.close()
+    local = BeaconChainDB.new(directory, localCfg)
+    check:
+      local.containsExecutionPayloadEnvelope(root)
+      not local.containsDataColumnSidecar(ConsensusFork.Gloas, root, ColumnIndex(0))
+    local.putDataColumnSidecars(@[column])
+    local.close()
+    local = BeaconChainDB.new(directory, localCfg)
+    var stored: gloas.DataColumnSidecar
+    check:
+      local.containsExecutionPayloadEnvelope(root)
+      local.getDataColumnSidecar(root, ColumnIndex(0), stored)
+      stored == column[]
+    local.close()
 
 suite "Quarantine" & preset():
   setup:

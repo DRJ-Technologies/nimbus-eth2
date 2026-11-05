@@ -1795,6 +1795,8 @@ proc doRootSyncStep(
             peer.updateScore(PeerScoreBadResponse)
             debug "Block verification NOT passed", reason = $res.error
             Opt.none(DagBlockSourceType)
+          of SyncVerifierError.LocalVerification:
+            Opt.none(DagBlockSourceType)
           of SyncVerifierError.InvalidSidecars:
             raiseAssert "Should not be returned for block verification"
           of SyncVerifierError.MissingParent:
@@ -1982,6 +1984,11 @@ proc handleEnvelopeVerificationErrors(
     bid = signedBlock.toBlockId()
 
   case reason
+  of SyncVerifierError.LocalVerification:
+    # Preserve pending work without blaming the peer for local historical
+    # key/data availability. Scheduling/retrieval policy is unchanged.
+    entry.flags.incl(DagEntryFlag.MissingEnvelope)
+    overseer.missingEnvelopes.incl(signedBlock.root)
   of SyncVerifierError.Invalid, SyncVerifierError.MissingEnvelope:
     if peer.isSome():
       if reason == SyncVerifierError.Invalid:
@@ -2205,6 +2212,8 @@ proc doRootSidecarsSyncStep(
             overseer.missingSidecars.excl(forkyBlck.root)
           of SyncVerifierError.MissingSidecars:
             # We still missing sidecars.
+            discard
+          of SyncVerifierError.LocalVerification:
             discard
           of SyncVerifierError.InvalidSidecars,
              SyncVerifierError.MissingEnvelope:

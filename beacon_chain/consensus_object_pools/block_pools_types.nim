@@ -66,6 +66,9 @@ type
       ## status from payload processing but helps syncer to distinguish which
       ## should be discarded.
 
+    LocalVerification
+      ## Local historical data/key cannot establish validity. No peer penalty.
+
   OnBlockCallback* =
     proc(data: ForkedTrustedSignedBeaconBlock) {.gcsafe, raises: [].}
   OnBlockGossipCallback* =

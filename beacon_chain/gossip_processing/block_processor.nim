@@ -8,13 +8,13 @@
 {.push raises: [], gcsafe.}
 
 import
-  chronicles, chronos, metrics, minilru,
+  chronicles, chronos, metrics, minilru, ssz_serialization,
   ../spec/[forks, helpers_el, signatures, signatures_batch, column_map,
            peerdas_helpers],
   ../sszdump
 
 from std/deques import Deque, addLast, contains, initDeque, items, len, shrink
-from std/sequtils import anyIt, filterIt, toSeq
+from std/sequtils import filterIt, toSeq
 from ../consensus_object_pools/consensus_manager import
   ConsensusManager, to, updateHead, updateExecutionHead, checkExpectedEnvelope
 from ../consensus_object_pools/blockchain_dag import
@@ -39,7 +39,8 @@ from ../validators/validator_monitor import
   MsgSource, ValidatorMonitor, registerAttestationInBlock, registerBeaconBlock,
   registerSyncAggregateInBlock
 from ../beacon_chain_db import
-  containsExecutionPayloadEnvelope, getDataColumnSidecar, putDataColumnSidecars
+  containsExecutionPayloadEnvelope, containsDataColumnSidecar,
+  getDataColumnSidecar, putDataColumnSidecars
 
 export sszdump, signatures_batch
 
@@ -238,7 +239,8 @@ proc dumpBlock(
       discard
 
 from ../consensus_object_pools/block_clearance import
-  addBackfillBlock, addBackfillExecutionPayload, addHeadBlockWithParent,
+  addBackfillBlock, addBackfillExecutionPayload, getBackfillPayloadBlock,
+  addHeadBlockWithParent, matchesPayloadBlock,
   addHeadExecutionPayload, checkHeadBlock, verifyBlockProposer
 
 proc verifySidecars(
@@ -567,54 +569,6 @@ proc onBlockAdded*(
         validatorMonitor[].registerSyncAggregateInBlock(
           blck.message.slot, blck.root, state.current_sync_committee.pubkeys.data[i]
         )
-
-proc verifyPayloadOnCL(
-    signedBlock: bellatrix.SignedBeaconBlock | capella.SignedBeaconBlock |
-                 deneb.SignedBeaconBlock | electra.SignedBeaconBlock |
-                 fulu.SignedBeaconBlock | gloas.SignedBeaconBlock |
-                 heze.SignedBeaconBlock,
-    signedEnvelope: NoEnvelope | gloas.SignedExecutionPayloadEnvelope):
-    Result[void, string] =
-  const consensusFork = typeof(signedBlock).kind
-  # When the execution layer is not available to verify the payload, we do the
-  # required checks on the CL instead and proceed as if the EL was syncing
-  # https://github.com/ethereum/consensus-specs/blob/v1.6.0-alpha.6/specs/bellatrix/beacon-chain.md#verify_and_notify_new_payload
-  # https://github.com/ethereum/consensus-specs/blob/v1.6.0-alpha.6/specs/deneb/beacon-chain.md#modified-verify_and_notify_new_payload
-
-  template payload(): auto =
-    when consensusFork >= ConsensusFork.Gloas:
-      signedEnvelope.message.payload
-    else:
-      signedBlock.message.body.execution_payload
-
-  if payload.transactions.anyIt(it.len == 0):
-    return err("Execution block contains zero length transactions")
-
-  template computedBlockHash(): auto =
-    when consensusFork >= ConsensusFork.Gloas:
-      signedEnvelope.message.compute_execution_block_hash()
-    else:
-      signedBlock.message.compute_execution_block_hash()
-  if payload.block_hash != computedBlockHash:
-    return err("Execution block hash validation failed")
-
-  # [New in Deneb:EIP4844]
-  when consensusFork >= ConsensusFork.Deneb:
-    let blobsRes =
-      when consensusFork >= ConsensusFork.Gloas:
-        signedBlock.message.is_valid_versioned_hashes(signedEnvelope.message)
-      else:
-        signedBlock.message.is_valid_versioned_hashes()
-    if blobsRes.isErr:
-      return err("Blob versioned hashes invalid, reason:" & $blobsRes.error)
-  else:
-    # If there are EIP-4844 (type 3) transactions in the payload with
-    # versioned hashes, the transactions would be rejected by the EL
-    # based on payload timestamp (only allowed post Deneb);
-    # There are no `blob_kzg_commitments` before Deneb to compare against
-    discard
-
-  ok()
 
 proc verifyPayload(
     self: ref BlockProcessor,
@@ -1023,18 +977,85 @@ proc addBlock*(
     of VerifierError.Duplicate:
       err(res.error())
 
+proc validateBackfillColumns(
+    self: BlockProcessor,
+    signedBlock: gloas.SignedBeaconBlock,
+    columns: gloas.DataColumnSidecars
+): Result[gloas.DataColumnSidecars, PayloadVerifierError] =
+  template bid(): auto =
+    signedBlock.message.body.signed_execution_payload_bid.message
+  var seen: ColumnMap
+  for column in columns:
+    if column == nil:
+      return err(PayloadVerifierError.InvalidSidecars)
+    verify_data_column_sidecar(
+        self.consensusManager.dag.cfg, column[], bid.blob_kzg_commitments).isOkOr:
+      return err(PayloadVerifierError.InvalidSidecars)
+    if column.beacon_block_root != signedBlock.root or
+        column.slot != signedBlock.message.slot or column.index in seen:
+      return err(PayloadVerifierError.InvalidSidecars)
+    seen.incl(column.index)
+  ?verifySidecars(signedBlock, Opt.some(columns))
+
+  var missing: gloas.DataColumnSidecars
+  let db = self.consensusManager.dag.db
+  for column in columns:
+    if db.containsDataColumnSidecar(
+        ConsensusFork.Gloas, signedBlock.root, column.index):
+      var stored: gloas.DataColumnSidecar
+      if not db.getDataColumnSidecar(signedBlock.root, column.index, stored) or
+          SSZ.encode(stored) != SSZ.encode(column[]):
+        # Do not overwrite corrupt/conflicting local content or blame a peer
+        # for the local database. Incoming columns passed KZG above.
+        return err(PayloadVerifierError.LocalVerification)
+    else:
+      missing.add(column)
+  ok(missing)
+
+proc persistBackfillColumns(
+    self: BlockProcessor, slot: Slot, columns: gloas.DataColumnSidecars) =
+  # Native putDataColumnSidecars commits its batch synchronously. Do not wrap
+  # this call in another transaction and emit the hook before that commit.
+  self.consensusManager.dag.db.putDataColumnSidecars(columns)
+  if columns.len > 0 and self.onDataColumnsStored != nil:
+    self.onDataColumnsStored(slot)
+
+proc addBackfillSidecars*(
+    self: ref BlockProcessor, bid: BlockId,
+    columns: gloas.DataColumnSidecars
+): Result[void, PayloadVerifierError] =
+  ## Native finalized column persistence, independent of envelope presence and
+  ## reconstruction quorum. No retrieval or scheduling is performed here.
+  let
+    signedBlock = ?self.consensusManager.dag.getBackfillPayloadBlock(
+      bid.root, bid.slot)
+    missing = ?self[].validateBackfillColumns(signedBlock, columns)
+  self[].persistBackfillColumns(signedBlock.message.slot, missing)
+  ok()
+
 proc storeBackfillPayload(
     self: var BlockProcessor,
     signedBlock: gloas.SignedBeaconBlock,
     signedEnvelope: gloas.SignedExecutionPayloadEnvelope,
     sidecarsOpt: Opt[gloas.DataColumnSidecars],
 ): Result[void, PayloadVerifierError] =
+  let
+    canonicalBlock = ?self.consensusManager.dag.getBackfillPayloadBlock(
+      signedBlock.root, signedBlock.message.slot)
+  if not matchesPayloadBlock(canonicalBlock, signedEnvelope):
+    return err(PayloadVerifierError.Invalid)
+  let
+    missing = ?self.validateBackfillColumns(
+      canonicalBlock, sidecarsOpt.valueOr(default(gloas.DataColumnSidecars)))
+    envelopeResult =
+      self.consensusManager.dag.addBackfillExecutionPayload(signedEnvelope)
+  if envelopeResult.isErr and envelopeResult.error != PayloadVerifierError.Duplicate:
+    return err(envelopeResult.error)
+
+  self.persistBackfillColumns(canonicalBlock.message.slot, missing)
   self.envelopeQuarantine[].remove(signedEnvelope.message.beacon_block_root)
-
-  ?verifySidecars(signedBlock, sidecarsOpt)
-  ?self.consensusManager.dag.addBackfillExecutionPayload(signedEnvelope)
-
-  self.storeSidecars(sidecarsOpt)
+  if missing.len == 0:
+    return envelopeResult
   ok()
 
 proc storePayload(
@@ -1174,6 +1195,9 @@ proc addPayload*(
       # valid. It should be marked as invalid so that we can ignore it from
       # gossip or skip processing the same one.
       self.envelopeQuarantine[].addUnviable(signedBlock.root)
+    of PayloadVerifierError.LocalVerification:
+      # Local historical key/data refusal is not evidence of an invalid peer.
+      discard
     of PayloadVerifierError.Duplicate:
       self.envelopeQuarantine[].remove(signedBlock.root)
 

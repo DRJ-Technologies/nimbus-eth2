@@ -23,7 +23,7 @@ export base, phase0, altair, merge, chronos, chronicles, results,
 type
   SyncVerifierError* {.pure.} = enum
     Invalid, InvalidSidecars, MissingParent, UnviableFork, Duplicate,
-    MissingSidecars, MissingEnvelope
+    MissingSidecars, MissingEnvelope, LocalVerification
   GetSlotCallback* = proc(): Slot {.gcsafe, raises: [].}
   GetBoolCallback* = proc(): bool {.gcsafe, raises: [].}
   ProcessingCallback* = proc() {.gcsafe, raises: [].}
@@ -99,7 +99,8 @@ type
     MissingEnvelope,
     InvalidSidecars,
     NoRelevant,
-    NoError
+    NoError,
+    LocalVerification
 
   SyncProcessingResult = object
     code: SyncProcessError
@@ -443,6 +444,8 @@ func init(t: typedesc[SyncProcessError],
     SyncProcessError.MissingSidecars
   of SyncVerifierError.MissingEnvelope:
     SyncProcessError.MissingEnvelope
+  of SyncVerifierError.LocalVerification:
+    SyncProcessError.LocalVerification
   of SyncVerifierError.InvalidSidecars:
     SyncProcessError.InvalidSidecars
 
@@ -492,6 +495,8 @@ func toSyncVerifierError*(a: PayloadVerifierError): SyncVerifierError =
     SyncVerifierError.UnviableFork
   of PayloadVerifierError.Duplicate:
     SyncVerifierError.Duplicate
+  of PayloadVerifierError.LocalVerification:
+    SyncVerifierError.LocalVerification
   of PayloadVerifierError.InvalidSidecars:
     SyncVerifierError.InvalidSidecars
 
@@ -1172,7 +1177,7 @@ proc process[M, N](
       case res.error()
       of SyncVerifierError.MissingParent, SyncVerifierError.MissingSidecars,
          SyncVerifierError.MissingEnvelope, SyncVerifierError.InvalidSidecars,
-         SyncVerifierError.Invalid:
+         SyncVerifierError.Invalid, SyncVerifierError.LocalVerification:
         return SyncProcessingResult.init(res.error(), ritem.slot, ritem.root)
       of SyncVerifierError.Duplicate:
         # Keep going, happens naturally
@@ -1198,7 +1203,7 @@ func isError(e: SyncProcessError): bool =
   case e
   of SyncProcessError.Empty, SyncProcessError.NoError,
      SyncProcessError.Duplicate, SyncProcessError.NoRelevant,
-     SyncProcessError.MissingSidecars:
+     SyncProcessError.MissingSidecars, SyncProcessError.LocalVerification:
     false
   of SyncProcessError.Invalid, SyncProcessError.UnviableFork,
      SyncProcessError.MissingParent, SyncProcessError.MissingEnvelope,
@@ -1494,6 +1499,13 @@ proc push*[M, N](
 
       fillCompleteness(position, true, Opt.none(BlockId), false)
       sq.advanceQueue(res)
+
+    of SyncProcessError.LocalVerification:
+      # Retry under normal sync custody, with no peer score, failure count,
+      # completeness advancement or rewind for a local verification limit.
+      fillCompleteness(position, false, pres.blck, false)
+      sq.del(position)
+      res = 0'i64
 
     of SyncProcessError.NoRelevant:
       raiseAssert "Processor should not return this error code"
