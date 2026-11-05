@@ -16,7 +16,7 @@ import
   kzg4844 as kzg,
   kzg4844/kzg_abi,
   ../beacon_chain/conf,
-  ../beacon_chain/spec/[beaconstate, forks, helpers,
+  ../beacon_chain/spec/[beaconstate, forks, helpers, helpers_el, signatures,
     peerdas_helpers, state_transition, column_map],
   ../beacon_chain/gossip_processing/block_processor,
   ../beacon_chain/sync/[sync_overseer2, sync_queue],
@@ -958,6 +958,63 @@ suite "Block processor" & preset():
           if envelopePresent:
             check SSZ.encode(db.getExecutionPayloadEnvelope(bid.root).get()) == saved
 
+  for kind, field in ["parent hash", "parent beacon root", "prev randao",
+                      "gas limit", "execution requests root"]:
+    asyncTest "Finalized Gloas canonical bid binding refuses " & field & preset():
+      finalizedColumnsFixture(true):
+        require matchesPayloadBlock(engine.blck, engine.envelope)
+        var incoming = copyFixture(engine.envelope)
+        case kind
+        of 0: incoming.message.payload.parent_hash.data[0] =
+          incoming.message.payload.parent_hash.data[0] xor 1'u8
+        of 1: incoming.message.parent_beacon_block_root.data[0] =
+          incoming.message.parent_beacon_block_root.data[0] xor 1'u8
+        of 2: incoming.message.payload.prev_randao.data[0] =
+          incoming.message.payload.prev_randao.data[0] xor 1'u8
+        of 3: incoming.message.payload.gas_limit += 1
+        else:
+          incoming.message.execution_requests.builder_exits.add(
+            default(gloas.BuilderExitRequest))
+        # Keep the EL hash, native BLS and the original four quick bindings
+        # valid: only this extra bid-field agreement rejects the envelope.
+        incoming.message.payload.block_hash =
+          incoming.message.compute_execution_block_hash()
+        var canonical = copyFixture(engine.blck)
+        canonical.message.body.signed_execution_payload_bid.message.block_hash =
+          incoming.message.payload.block_hash
+        canonical.root = hash_tree_root(canonical.message)
+        canonical.signature = get_block_signature(forkyState.data.fork,
+          dag.genesis_validators_root, bid.slot, canonical.root,
+          MockPrivKeys[canonical.message.proposer_index]).toValidatorSig()
+        incoming.message.beacon_block_root = canonical.root
+        incoming.signature = get_execution_payload_envelope_signature(
+          forkyState.data.fork, dag.genesis_validators_root, bid.slot.epoch,
+          incoming.message, MockPrivKeys[canonical.message.proposer_index]).toValidatorSig()
+        require verifyPayloadOnCL(canonical, incoming).isOk
+        require verify_execution_payload_envelope_signature(
+          dag.forkAtEpoch(bid.slot.epoch), dag.genesis_validators_root,
+          bid.slot.epoch, incoming.message,
+          MockPubKeys[canonical.message.proposer_index], incoming.signature)
+        require not matchesPayloadBlock(canonical, incoming)
+        # Model the trusted canonical block index, not a finality replay.
+        let forked = ForkedSignedBeaconBlock.init(canonical)
+        db.putBlock(forked.asTrusted().gloasData)
+        dag.head = BlockRef.init(canonical.root, OptimisticStatus.valid, canonical.message)
+        dag.finalizedHead = BlockSlot(blck: dag.head, slot: bid.slot)
+        var column = newClone(copyFixture(columns[0][]))
+        column.beacon_block_root = canonical.root
+        var wakes: seq[Slot]
+        processor.onDataColumnsStored = proc(slot: Slot) = wakes.add(slot)
+        let direct = dag.addBackfillExecutionPayload(incoming)
+        let combined = await processor.addPayload(
+          canonical, incoming, Opt.some(@[column]))
+        check:
+          direct.isErr and direct.error == PayloadVerifierError.Invalid
+          combined.isErr and combined.error == PayloadVerifierError.Invalid
+          not db.containsExecutionPayloadEnvelope(canonical.root)
+          not db.containsDataColumnSidecar(ConsensusFork.Gloas, canonical.root, ColumnIndex(0))
+          wakes.len == 0
+
   asyncTest "Finalized Gloas self-build bad signature is Invalid before Duplicate" & preset():
     finalizedColumnsFixture(true):
       var bad = copyFixture(engine.envelope)
@@ -1080,6 +1137,82 @@ suite "Block processor" & preset():
       let refused = dag.addBackfillExecutionPayload(envelope)
       check:
         refused.isErr and refused.error == PayloadVerifierError.LocalVerification
+        SSZ.encode(db.getExecutionPayloadEnvelope(historical.root).get()) == saved
+
+  asyncTest "Historical later builder key cannot authenticate an envelope or block column repair" & preset():
+    finalizedColumnsFixture(true):
+      prepareHistoricalFixture()
+      # Native generated block/signature/KZG material, with a trusted stored
+      # finalized pair and key transition modeled as in the B builder test.
+      # This is not a historical state-transition or finality replay.
+      var historical = copyFixture(engine.blck)
+      historical.message.body.signed_execution_payload_bid.message.builder_index = BuilderIndex(0)
+      historical.message.body.signed_execution_payload_bid.signature =
+        get_execution_payload_bid_signature(forkyState.data.fork,
+          dag.genesis_validators_root, bid.slot.epoch,
+          historical.message.body.signed_execution_payload_bid.message,
+          MockPrivKeys[0'u64]).toValidatorSig()
+      historical.root = hash_tree_root(historical.message)
+      historical.signature = get_block_signature(forkyState.data.fork,
+        dag.genesis_validators_root, bid.slot, historical.root,
+        MockPrivKeys[historical.message.proposer_index]).toValidatorSig()
+      var descendant = copyFixture(child.blck)
+      descendant.message.parent_root = historical.root
+      descendant.message.body.signed_execution_payload_bid.message.parent_block_root = historical.root
+      descendant.root = hash_tree_root(descendant.message)
+      descendant.signature = get_block_signature(forkyState.data.fork,
+        dag.genesis_validators_root, descendant.message.slot, descendant.root,
+        MockPrivKeys[descendant.message.proposer_index]).toValidatorSig()
+      db.putBlock(ForkedSignedBeaconBlock.init(historical).asTrusted().gloasData)
+      db.putBlock(ForkedSignedBeaconBlock.init(descendant).asTrusted().gloasData)
+      db.finalizedBlocks.insert(bid.slot, historical.root)
+      db.finalizedBlocks.insert(descendant.message.slot, descendant.root)
+      dag.head = BlockRef.init(descendant.root, OptimisticStatus.valid, descendant.message)
+      dag.finalizedHead = BlockSlot(blck: dag.head, slot: descendant.message.slot)
+      dag.headState.gloasData.data.builders.add(gloas.Builder(
+        pubkey: MockPubKeys[1'u64], version: PAYLOAD_BUILDER_VERSION,
+        deposit_epoch: bid.slot.epoch + 1, withdrawable_epoch: FAR_FUTURE_EPOCH))
+      var incoming = copyFixture(engine.envelope)
+      incoming.message.builder_index = BuilderIndex(0)
+      incoming.message.beacon_block_root = historical.root
+      incoming.signature = get_execution_payload_envelope_signature(
+        forkyState.data.fork, dag.genesis_validators_root, bid.slot.epoch,
+        incoming.message, MockPrivKeys[1'u64]).toValidatorSig()
+      require matchesPayloadBlock(historical, incoming)
+      require verifyPayloadOnCL(historical, incoming).isOk
+      require verify_execution_payload_envelope_signature(
+        dag.forkAtEpoch(bid.slot.epoch), dag.genesis_validators_root,
+        bid.slot.epoch, incoming.message, MockPubKeys[1'u64], incoming.signature)
+      let refused = dag.addBackfillExecutionPayload(incoming)
+      require refused.isErr and refused.error == PayloadVerifierError.LocalVerification
+      require not db.containsExecutionPayloadEnvelope(historical.root)
+      peer.envelopes = @[newClone(incoming)]
+      peer.columns = @[]
+      for original in columns:
+        let column = newClone(copyFixture(original[]))
+        column.beacon_block_root = historical.root
+        peer.columns.add(column)
+      let historicalId = historical.toBlockId()
+      require dag.historicalPayloadStatus(historicalId) == HistoricalPayloadStatus.Full
+      overseer.notifyHistoricalPayload(historicalId, custody)
+      require (await overseer.doHistoricalPayloadStep(peer, peerEntry, getCustody, getSlot))
+      check:
+        peer.envelopeCalls == 1 and peer.columnCalls == 1
+        peer.score == 1000 + PeerScoreGoodValues # C progress only; no local penalty
+        not db.containsExecutionPayloadEnvelope(historical.root)
+        db.containsDataColumnSidecar(ConsensusFork.Gloas, historical.root, ColumnIndex(31))
+        not db.containsDataColumnSidecar(ConsensusFork.Gloas, historical.root, ColumnIndex(32))
+        overseer.historicalPayload.isSome()
+      # A pre-existing old-key envelope is preserved on the same local refusal.
+      var oldEnvelope = copyFixture(incoming)
+      oldEnvelope.signature = get_execution_payload_envelope_signature(
+        forkyState.data.fork, dag.genesis_validators_root, bid.slot.epoch,
+        oldEnvelope.message, MockPrivKeys[0'u64]).toValidatorSig()
+      db.putExecutionPayloadEnvelope(oldEnvelope)
+      let saved = SSZ.encode(db.getExecutionPayloadEnvelope(historical.root).get())
+      let duplicateRefusal = dag.addBackfillExecutionPayload(incoming)
+      check:
+        duplicateRefusal.isErr and duplicateRefusal.error == PayloadVerifierError.LocalVerification
         SSZ.encode(db.getExecutionPayloadEnvelope(historical.root).get()) == saved
 
   asyncTest "Historical work gates undecidable and EMPTY without any network" & preset():

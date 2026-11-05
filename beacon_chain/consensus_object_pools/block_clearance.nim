@@ -500,7 +500,13 @@ func matchesPayloadBlock*(
   signedBlock.message.slot == signedEnvelope.message.slot and
     signedBlock.root == signedEnvelope.message.beacon_block_root and
     bid.builder_index == signedEnvelope.message.builder_index and
-    bid.block_hash == signedEnvelope.message.payload.block_hash
+    bid.block_hash == signedEnvelope.message.payload.block_hash and
+    bid.parent_block_hash == signedEnvelope.message.payload.parent_hash and
+    bid.parent_block_root == signedEnvelope.message.parent_beacon_block_root and
+    bid.prev_randao == signedEnvelope.message.payload.prev_randao and
+    bid.gas_limit == signedEnvelope.message.payload.gas_limit and
+    bid.execution_requests_root ==
+      hash_tree_root(signedEnvelope.message.execution_requests)
 
 proc addHeadExecutionPayload*(
     dag: ChainDAGRef,
@@ -620,9 +626,8 @@ proc addBackfillExecutionPayload*(
     bidBuilderIdx = signedBlock.message.body.signed_execution_payload_bid.
       message.builder_index
 
-  # Verify signature. Only a later external-builder assignment makes the
-  # current key insufficient for judging this historical signature.
-  var signatureFailure = PayloadVerifierError.Invalid
+  # A later external-builder assignment cannot authenticate this historical
+  # envelope, even if its new key happens to verify the incoming signature.
   let builderKey =
     withState(dag.headState):
       when consensusFork >= ConsensusFork.Gloas:
@@ -635,7 +640,7 @@ proc addBackfillExecutionPayload*(
             return err(PayloadVerifierError.LocalVerification)
           let builder = forkyState.data.builders.item(bidBuilderIdx)
           if builder.deposit_epoch > envelope.slot.epoch:
-            signatureFailure = PayloadVerifierError.LocalVerification
+            return err(PayloadVerifierError.LocalVerification)
           builder.pubkey
       else:
         return err(PayloadVerifierError.LocalVerification)
@@ -646,7 +651,7 @@ proc addBackfillExecutionPayload*(
       envelope,
       builderKey,
       signedEnvelope.signature):
-    return err(signatureFailure)
+    return err(PayloadVerifierError.Invalid)
   let sigVerifyTick = Moment.now
 
   if dag.db.containsExecutionPayloadEnvelope(blockRoot):
