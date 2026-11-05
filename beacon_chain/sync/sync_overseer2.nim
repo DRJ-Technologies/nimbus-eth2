@@ -13,7 +13,8 @@ import
   ../spec/[helpers, forks, network, column_map],
   ../networking/[peer_pool, eth2_network],
   ../consensus_object_pools/[consensus_manager, block_pools_types,
-      blockchain_dag, block_quarantine, column_quarantine, envelope_quarantine],
+      blockchain_dag, block_quarantine, column_quarantine, envelope_quarantine,
+      block_clearance, column_reconstruction_backfiller],
   ../gossip_processing/block_processor,
   ../[beacon_clock],
   ./[sync_types, sync_dag, sync_queue, sync_protocol, response_utils,
@@ -336,10 +337,9 @@ func getSidecarsHorizon(
     else:
       raiseAssert "Unsupported fork"
 
-proc getColumnsHorizon(overseer: SyncOverseerRef2): Epoch =
+proc getColumnsHorizon(overseer: SyncOverseerRef2, currentEpoch: Epoch): Epoch =
   let
     dag = overseer.consensusManager.dag
-    currentEpoch = overseer.beaconClock.currentSlot().epoch()
     horizon = dag.cfg.MIN_EPOCHS_FOR_DATA_COLUMN_SIDECARS_REQUESTS
     tempEpoch =
       if currentEpoch < horizon:
@@ -353,18 +353,23 @@ proc getColumnsHorizon(overseer: SyncOverseerRef2): Epoch =
   else:
     tempEpoch
 
-proc shouldGetColumns(overseer: SyncOverseerRef2, slot: Slot): bool =
+proc shouldGetColumns(
+    overseer: SyncOverseerRef2, slot: Slot, currentEpoch: Epoch): bool =
   if overseer.config.historyMode == HistoryMode.ColumnArchive:
     let dag = overseer.consensusManager.dag
     if slot.epoch() >= dag.cfg.FULU_FORK_EPOCH:
       return true
     return false
-  slot.epoch() >= overseer.getColumnsHorizon()
+  slot.epoch() >= overseer.getColumnsHorizon(currentEpoch)
 
-proc checkDataAvailable(
-    peer: Peer,
+proc shouldGetColumns(overseer: SyncOverseerRef2, slot: Slot): bool =
+  overseer.shouldGetColumns(slot, overseer.beaconClock.currentSlot().epoch())
+
+proc checkDataAvailable[P](
+    peer: P,
     slot: Slot
 ): bool =
+  mixin getEarliestAvailableSlot
   let eaSlot = peer.getEarliestAvailableSlot().valueOr:
     return true
   slot >= eaSlot
@@ -381,6 +386,234 @@ proc checkDataAvailable(
     srange.start_slot() >= eaSlot
   of SyncQueueKind.Backward:
     srange.last_slot() >= eaSlot
+
+type
+  HistoricalPayloadStatus* {.pure.} = enum
+    Undecidable, Empty, Full
+
+  HistoricalPayloadInputs = object
+    blck: gloas.SignedBeaconBlock
+    envelope: bool
+    columns: ColumnMap
+    frontier: bool
+
+proc historicalPayloadStatus*(
+    dag: ChainDAGRef, bid: BlockId): HistoricalPayloadStatus =
+  let parent = dag.getBackfillPayloadBlock(bid.root, bid.slot).valueOr:
+    return HistoricalPayloadStatus.Undecidable
+  if dag.finalizedHead.blck == nil or bid.slot >= dag.finalizedHead.blck.slot:
+    return HistoricalPayloadStatus.Undecidable
+
+  # Native historical lookup returns the last proposed block at/before a slot.
+  # Binary search locates its first successor even across missed slots, with
+  # at most 64 lookups and no new history cursor or unbounded forward scan.
+  var
+    low = bid.slot + 1
+    high = dag.finalizedHead.blck.slot
+  while low < high:
+    let middle = low + uint64(high - low) div 2
+    let mapped = dag.getBlockIdAtSlot(middle).valueOr:
+      return HistoricalPayloadStatus.Undecidable
+    if mapped.bid.slot > bid.slot:
+      high = middle
+    elif mapped.bid == bid:
+      low = middle + 1
+    else:
+      return HistoricalPayloadStatus.Undecidable
+  let childId = dag.getBlockIdAtSlot(low).valueOr:
+    return HistoricalPayloadStatus.Undecidable
+  if not childId.isProposed() or childId.bid.slot != low:
+    return HistoricalPayloadStatus.Undecidable
+  let child = dag.getBackfillPayloadBlock(childId.bid.root, low).valueOr:
+    return HistoricalPayloadStatus.Undecidable
+  if child.message.parent_root != bid.root:
+    return HistoricalPayloadStatus.Undecidable
+  # Same parent-payload predicate as fork choice, using the canonical stored
+  # direct pair. BID commitments alone do not imply a delivered FULL payload.
+  if child.message.body.signed_execution_payload_bid.message.parent_block_hash ==
+      parent.message.body.signed_execution_payload_bid.message.block_hash:
+    HistoricalPayloadStatus.Full
+  else:
+    HistoricalPayloadStatus.Empty
+
+proc historicalPayloadInputs(
+    overseer: SyncOverseerRef2, bid: BlockId, custody: ColumnMap
+): Opt[HistoricalPayloadInputs] =
+  let dag = overseer.consensusManager.dag
+  if dag.historicalPayloadStatus(bid) != HistoricalPayloadStatus.Full:
+    return Opt.none(HistoricalPayloadInputs)
+  let blck = dag.getBackfillPayloadBlock(bid.root, bid.slot).valueOr:
+    return Opt.none(HistoricalPayloadInputs)
+  let needEnvelope = not dag.db.containsExecutionPayloadEnvelope(bid.root)
+  var
+    missing: ColumnMap
+    have = 0
+  if blck.message.body.signed_execution_payload_bid.message.blob_kzg_commitments.len > 0:
+    for i in 0'u64 ..< NUMBER_OF_COLUMNS:
+      if dag.db.containsDataColumnSidecar(ConsensusFork.Gloas, bid.root, ColumnIndex(i)):
+        inc have
+      elif ColumnIndex(i) in custody:
+        missing.incl(ColumnIndex(i))
+  if not needEnvelope and missing.empty():
+    return Opt.none(HistoricalPayloadInputs)
+  Opt.some(HistoricalPayloadInputs(blck: blck, envelope: needEnvelope,
+    columns: missing,
+    frontier: not missing.empty() and have < ColumnsRequiredForReconstruction))
+
+proc notifyHistoricalPayload*(
+    overseer: SyncOverseerRef2, bid: BlockId, custody: ColumnMap) =
+  ## Called only for an actually visited finalized reconstruction slot.
+  let inputs = overseer.historicalPayloadInputs(bid, custody).valueOr:
+    if overseer.historicalPayload.isSome():
+      let old = overseer.historicalPayload.get()
+      if old.bid == bid and not old.busy:
+        overseer.historicalPayload = Opt.none(HistoricalPayloadWork)
+    return
+  if overseer.historicalPayload.isSome():
+    var old = overseer.historicalPayload.get()
+    if old.bid == bid:
+      old.frontier = inputs.frontier
+      overseer.historicalPayload = Opt.some(old)
+    elif not old.busy and inputs.frontier and not old.frontier:
+      overseer.historicalPayload = Opt.some(HistoricalPayloadWork(
+        bid: bid, frontier: true))
+    # Busy items cannot be replaced. Dropped E-only notifications are only
+    # re-derived on restart; there is no automatic rescan of the old run.
+  else:
+    overseer.historicalPayload = Opt.some(HistoricalPayloadWork(
+      bid: bid, frontier: inputs.frontier))
+
+proc doHistoricalPayloadStep*[P](
+    overseer: SyncOverseerRef2, peer: P, peerEntry: PeerEntryRef[P],
+    getCustody: LocalColumnMapCallback, getSlot: GetSlotCallback
+): Future[bool] {.async: (raises: [CancelledError]).} =
+  ## One item inside the existing peer loop, using native range transport,
+  ## response validation and accepted BlockProcessor persistence. Generics
+  ## permit local peer test doubles without a second executor or transport.
+  mixin getEarliestAvailableSlot, getFinalizedCheckpoint, getColumnMapOrDefault,
+    executionPayloadEnvelopesByRange, dataColumnSidecarsByRangeGloas, updateScore
+  if overseer.historicalPayload.isNone():
+    return true
+  var work = overseer.historicalPayload.get()
+  let nowSlot = getSlot()
+  if work.busy or (work.attemptedAt.isSome() and nowSlot <= work.attemptedAt.get()):
+    return true
+  let inputs = overseer.historicalPayloadInputs(work.bid, getCustody()).valueOr:
+    overseer.historicalPayload = Opt.none(HistoricalPayloadWork)
+    return true
+  let dag = overseer.consensusManager.dag
+  let epoch = nowSlot.epoch()
+  let envelopeHorizon =
+    if epoch > dag.cfg.MIN_EPOCHS_FOR_BLOCK_REQUESTS:
+      epoch - dag.cfg.MIN_EPOCHS_FOR_BLOCK_REQUESTS
+    else:
+      GENESIS_EPOCH
+  let
+    wantEnvelope = inputs.envelope and work.bid.slot.epoch() >= envelopeHorizon
+    wantColumns = overseer.shouldGetColumns(work.bid.slot, epoch)
+  if not wantEnvelope and (not wantColumns or inputs.columns.empty()):
+    overseer.historicalPayload = Opt.none(HistoricalPayloadWork)
+    return true
+  if peer.getFinalizedCheckpoint().epoch.start_slot() < work.bid.slot:
+    return true
+  var requested: ColumnMap
+  # earliest_available_slot advertises columns, not envelopes. Preserve that
+  # native distinction, especially for zero-commitment E-only work.
+  if wantColumns and checkDataAvailable(peer, work.bid.slot):
+    let eligible = inputs.columns and peer.getColumnMapOrDefault()
+    for index in eligible:
+      if requested.len >= min(peerEntry.maxSidecarsPerRequest, int(NUMBER_OF_COLUMNS)):
+        break
+      requested.incl(index)
+  let requestEnvelope = wantEnvelope and peerEntry.maxEnvelopesPerRequest > 0
+  if not requestEnvelope and requested.empty():
+    return true
+
+  work.busy = true
+  work.attemptedAt = Opt.some(nowSlot)
+  overseer.historicalPayload = Opt.some(work)
+  var progress = false
+  let request = SyncRange.init(work.bid.slot, 1'u64)
+  try:
+    if requestEnvelope:
+      let envelopes = (await executionPayloadEnvelopesByRange(
+        peer, work.bid.slot, 1'u64)).valueOr:
+        if not rsrcUnavailable(error):
+          peer.updateScore(PeerScoreNoValues)
+          return false
+        # Envelope retention/availability is independent of columns. An
+        # unavailable envelope must not suppress a valid column-only batch.
+        default(List[ref gloas.SignedExecutionPayloadEnvelope,
+          Limit MAX_REQUEST_BLOCKS_DENEB])
+      checkResponse(request, envelopes.asSeq()).isOkOr:
+        peer.updateScore(PeerScoreBadResponse)
+        return false
+      let fresh = overseer.historicalPayloadInputs(work.bid, getCustody()).valueOr:
+        return true
+      let local = @[newClone(ForkedSignedBeaconBlock.init(fresh.blck))]
+      let combined = combineResponse(request, local, envelopes.asSeq()).valueOr:
+        peer.updateScore(PeerScoreBadResponse)
+        return false
+      if combined.len > 0 and combined[0].signedEnvelope != nil:
+        let res = await overseer.blockProcessor.addPayload(fresh.blck,
+          combined[0].signedEnvelope[], Opt.none(gloas.DataColumnSidecars))
+        if res.isOk():
+          progress = true
+          peer.updateScore(PeerScoreGoodValues)
+        elif res.error notin {PayloadVerifierError.Duplicate,
+                             PayloadVerifierError.LocalVerification}:
+          peer.updateScore(PeerScoreBadValues)
+          return false
+
+    if not requested.empty():
+      let columns = (await dataColumnSidecarsByRangeGloas(peer,
+        work.bid.slot, 1'u64,
+        List[ColumnIndex, NUMBER_OF_COLUMNS](requested.items().toSeq()),
+        requested.len)).valueOr:
+        if rsrcUnavailable(error):
+          return true
+        peer.updateScore(PeerScoreNoValues)
+        return false
+      let grouped = groupSidecars(request, requested, columns.asSeq()).valueOr:
+        peer.updateScore(PeerScoreBadResponse)
+        return false
+      # Recheck FULL/canonical eligibility after awaiting. A custody reduction
+      # drops this response without blaming a peer that answered our request.
+      let fresh = overseer.historicalPayloadInputs(work.bid, getCustody()).valueOr:
+        return true
+      if (requested and getCustody()) != requested:
+        return true
+      var addsColumns = false
+      for record in grouped:
+        if record.sidecar.index in fresh.columns:
+          addsColumns = true
+      let res = overseer.blockProcessor.addBackfillSidecars(
+        work.bid, grouped.mapIt(it.sidecar))
+      if res.isErr():
+        if res.error != PayloadVerifierError.LocalVerification:
+          peer.updateScore(PeerScoreBadValues)
+          return false
+      elif addsColumns:
+        progress = true
+        peer.updateScore(PeerScoreGoodValues)
+    return true
+  finally:
+    if progress:
+      peerEntry.setWorking()
+    if overseer.historicalPayload.isSome() and
+        overseer.historicalPayload.get().bid == work.bid:
+      var pending = overseer.historicalPayload.get()
+      pending.busy = false
+      if progress:
+        pending.attemptedAt = Opt.none(Slot)
+      let remaining = overseer.historicalPayloadInputs(work.bid, getCustody())
+      if remaining.isNone():
+        overseer.historicalPayload = Opt.none(HistoricalPayloadWork)
+      else:
+        pending.frontier = remaining.get().frontier
+        overseer.historicalPayload = Opt.some(pending)
+    # No-progress retries use the existing native slot cadence/peer pause.
+    # There is no detached retry task, new timer or queue rewind.
 
 proc startPeer(
   overseer: SyncOverseerRef2, peer: Peer): Future[void] {.async: (raises: []).}
@@ -3318,6 +3551,15 @@ proc startPeer(
             break
           if not(overseer.pool.checkPeerScore(peer)):
             break
+
+      if overseer.wallSyncDistance() <= SyncDeviationSlotsCount:
+        let
+          custody = proc(): ColumnMap = overseer.validatorCustody.getMap()
+          slot = proc(): Slot = overseer.beaconClock.currentSlot()
+        if not(await overseer.doHistoricalPayloadStep(peer, peerEntry, custody, slot)):
+          break
+        if not overseer.pool.checkPeerScore(peer):
+          break
 
       if not(await overseer.doPeerPause(peer, peerEntry, loopTime)):
         break

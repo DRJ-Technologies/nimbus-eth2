@@ -38,7 +38,7 @@ declareGauge beacon_column_reconstruction_earliest_available_slot,
 
 const
   # https://github.com/ethereum/consensus-specs/blob/v1.7.0-alpha.10/specs/fulu/das-core.md#reconstruction-and-cross-seeding
-  ColumnsRequiredForReconstruction = NUMBER_OF_COLUMNS div 2
+  ColumnsRequiredForReconstruction* = NUMBER_OF_COLUMNS div 2
 
   # Idle delay when there's no slot pending reconstruction (caught up, blocked,
   # or in limited custody). Roughly one slot so we pick up a new head or newly
@@ -64,6 +64,8 @@ type
     dag: ChainDAGRef
     validatorCustody: ValidatorCustodyRef
     taskpool: Taskpool
+    onMissingData*: proc(bid: BlockId) {.gcsafe, raises: [].}
+      ## Observes an actually visited finalized slot; performs no retrieval.
     # Reconstruction progress as O(1) slot cursors (no per-slot map). The
     # established, fully-servable run is the contiguous range
     # `[runBottom..runTop]`; `frontier` is the slot currently being worked.
@@ -295,6 +297,14 @@ proc processSlot(
     blockRoot = bsi.bid.root
     have = existingColumns(self.dag.db, columnFork, blockRoot)
 
+  # Report envelope-only holes before the complete-column early return.
+  # The consumer rechecks canonical FULL status and actual DB/custody needs.
+  if blockFork == ConsensusFork.Gloas and slot <= self.dag.finalizedHead.slot and
+      self.onMissingData != nil and
+      (have.lenu64 < NUMBER_OF_COLUMNS or
+       not self.dag.db.containsExecutionPayloadEnvelope(blockRoot)):
+    self.onMissingData(bsi.bid)
+
   if have.lenu64 == NUMBER_OF_COLUMNS:
     return SlotRecon.Servable
 
@@ -440,3 +450,6 @@ proc run*(
   except CancelledError:
     discard
   debug "Column reconstruction backfiller stopped"
+
+when defined(testing):
+  export processSlot

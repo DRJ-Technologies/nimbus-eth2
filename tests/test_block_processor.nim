@@ -9,7 +9,7 @@
 {.used.}
 
 import
-  chronos,
+  chronos, std/[sets, tables],
   ssz_serialization,
   unittest2,
   taskpools,
@@ -17,8 +17,11 @@ import
   kzg4844/kzg_abi,
   ../beacon_chain/conf,
   ../beacon_chain/spec/[beaconstate, forks, helpers,
-    peerdas_helpers, state_transition],
+    peerdas_helpers, state_transition, column_map],
   ../beacon_chain/gossip_processing/block_processor,
+  ../beacon_chain/sync/[sync_overseer2, sync_queue],
+  ../beacon_chain/networking/[eth2_network, peer_scores],
+  ../beacon_chain/consensus_object_pools/column_reconstruction_backfiller,
   ../beacon_chain/consensus_object_pools/[
     blockchain_dag, block_quarantine, block_clearance, column_quarantine,
     consensus_manager, envelope_quarantine
@@ -31,7 +34,6 @@ from std/strutils import rsplit
 from chronos/unittest2/asynctests import asyncTest
 from ../beacon_chain/consensus_object_pools/attestation_pool import
   AttestationPool, init
-from ../beacon_chain/spec/column_map import supernodeMap
 from ../beacon_chain/spec/eth2_apis/dynamic_fee_recipients import
   DynamicFeeRecipientsStore, init
 from ../beacon_chain/validators/action_tracker import ActionTracker
@@ -65,6 +67,58 @@ proc copyFixture[T](value: T): T =
     SSZ.decode(SSZ.encode(value), T)
   except SerializationError:
     raiseAssert "generated fixture must round trip"
+
+type
+  HistoricalTestPeer = ref object
+    checkpoint: Checkpoint
+    earliest: Opt[Slot]
+    columnsMap: ColumnMap
+    score: int
+    envelopes: seq[ref gloas.SignedExecutionPayloadEnvelope]
+    columns: gloas.DataColumnSidecars
+    envelopeFailure, columnFailure: Opt[Eth2NetworkingError]
+    allColumns: bool
+    onRequest: proc() {.gcsafe, raises: [].}
+    envelopeCalls, columnCalls: int
+    maximum: int
+
+func getFinalizedCheckpoint(peer: HistoricalTestPeer): Checkpoint = peer.checkpoint
+func getEarliestAvailableSlot(peer: HistoricalTestPeer): Opt[Slot] = peer.earliest
+func getColumnMapOrDefault(peer: HistoricalTestPeer): ColumnMap = peer.columnsMap
+proc updateScore(peer: HistoricalTestPeer, score: int) = peer.score += score
+
+proc executionPayloadEnvelopesByRange(
+    peer: HistoricalTestPeer, slot: Slot, count: uint64):
+    Future[NetRes[List[ref gloas.SignedExecutionPayloadEnvelope,
+      Limit MAX_REQUEST_BLOCKS_DENEB]]] {.async: (raises: [CancelledError]).} =
+  doAssert count == 1
+  inc peer.envelopeCalls
+  if peer.onRequest != nil:
+    let callback = peer.onRequest
+    peer.onRequest = nil
+    callback()
+  if peer.envelopeFailure.isSome(): return err(peer.envelopeFailure.get())
+  return ok(List[ref gloas.SignedExecutionPayloadEnvelope,
+    Limit MAX_REQUEST_BLOCKS_DENEB](peer.envelopes))
+
+proc dataColumnSidecarsByRangeGloas(
+    peer: HistoricalTestPeer, slot: Slot, count: uint64,
+    indices: List[ColumnIndex, NUMBER_OF_COLUMNS], maximum: int):
+    Future[NetRes[List[ref gloas.DataColumnSidecar,
+      Limit MAX_REQUEST_DATA_COLUMN_SIDECARS]]] {.async: (raises: [CancelledError]).} =
+  doAssert count == 1 and maximum == indices.len and maximum <= 128
+  inc peer.columnCalls
+  peer.maximum = maximum
+  if peer.onRequest != nil:
+    let callback = peer.onRequest
+    peer.onRequest = nil
+    callback()
+  if peer.columnFailure.isSome(): return err(peer.columnFailure.get())
+  var data: gloas.DataColumnSidecars
+  for column in peer.columns:
+    if peer.allColumns or column.index in indices.asSeq(): data.add(column)
+  return ok(List[ref gloas.DataColumnSidecar,
+    Limit MAX_REQUEST_DATA_COLUMN_SIDECARS](data))
 
 suite "Block processor" & preset():
   setup:
@@ -752,7 +806,7 @@ suite "Block processor" & preset():
     check res4.isOk
 
 
-  template finalizedColumnsFixture(body: untyped) {.dirty.} =
+  template finalizedColumnsFixture(withBlobs: static bool, body: untyped) {.dirty.} =
     process_slots(cfg, state[], start_slot(cfg.GLOAS_FORK_EPOCH),
       cache, info, {}).expect("Gloas fixture")
     let processor {.inject.} = BlockProcessor.new(
@@ -765,14 +819,17 @@ suite "Block processor" & preset():
           commitment = kzg.blobToKzgCommitment(blob).expect("fixture commitment")
           cellsAndProofs = kzg.computeCellsAndKzgProofs(blob).expect("fixture cells")
           proofs = cellsAndProofs.proofs.mapIt(kzg.KzgProof(it))
-          bundle = testblockutil.BlobsBundle(
-            commitments: @[commitment], proofs: proofs, blobs: @[blob.bytes])
+          bundle =
+            if withBlobs:
+              testblockutil.BlobsBundle(commitments: @[commitment], proofs: proofs, blobs: @[blob.bytes])
+            else:
+              default(testblockutil.BlobsBundle)
           engine {.inject.} = addTestEngineBlock(
             cfg, ConsensusFork.Gloas, forkyState, cache, blobs_bundle = bundle)
           columns {.inject.} = assemble_data_column_sidecars(
             engine.blck, @[blob], proofs, supernodeMap)
           bid {.inject.} = engine.blck.toBlockId()
-        require columns.len == NUMBER_OF_COLUMNS.int
+        require columns.len == (if withBlobs: NUMBER_OF_COLUMNS.int else: 0)
         require (await processor.addBlock(
           MsgSource.sync, engine.blck, noSidecars)).isOk
         dag.updateHead(dag.getBlockRef(bid.root).get(), quarantine[], [])
@@ -781,8 +838,34 @@ suite "Block processor" & preset():
         dag.finalizedHead = BlockSlot(blck: dag.head, slot: bid.slot)
         body
 
+  template prepareHistoricalFixture() {.dirty.} =
+    process_slots(cfg, state[], bid.slot + 3, cache, info, {}).expect("canonical child after missed slots")
+    let child = addTestEngineBlock(cfg, ConsensusFork.Gloas, forkyState,
+      cache, blobs_bundle = engine.blobsBundle)
+    require (await processor.addBlock(MsgSource.sync, child.blck, noSidecars)).isOk
+    dag.updateHead(dag.getBlockRef(child.blck.root).get(), quarantine[], [])
+    dag.finalizedHead = BlockSlot(blck: dag.head, slot: child.blck.message.slot)
+    db.finalizedBlocks.insert(bid.slot, bid.root)
+    db.finalizedBlocks.insert(child.blck.message.slot, child.blck.root)
+    dag.forkBlocks.excl(KeyedBlockRef.asLookupKey(bid.root))
+    require dag.getBlockRef(bid.root).isNone()
+    let
+      overseer = SyncOverseerRef2(consensusManager: consensusManager,
+        blockProcessor: processor, config: default(BeaconNodeConf))
+      peer = HistoricalTestPeer(checkpoint: Checkpoint(epoch: bid.slot.epoch + 1),
+        columnsMap: supernodeMap, score: 1000,
+        envelopes: @[newClone(engine.envelope)], columns: columns)
+      peerEntry = PeerEntryRef[HistoricalTestPeer](peer: peer,
+        maxEnvelopesPerRequest: 1, maxSidecarsPerRequest: 32)
+    var
+      custody = supernodeMap
+      clock = child.blck.message.slot
+    let
+      getCustody = proc(): ColumnMap = custody
+      getSlot = proc(): Slot = clock
+
   asyncTest "Finalized Gloas duplicate envelope repairs columns after envelope-only commit" & preset():
-    finalizedColumnsFixture:
+    finalizedColumnsFixture(true):
       var wakes: seq[Slot]
       processor.onDataColumnsStored = proc(slot: Slot) = wakes.add(slot)
       require (await processor.addPayload(
@@ -802,7 +885,7 @@ suite "Block processor" & preset():
 
   for envelopePresent in [false, true]:
     asyncTest "Finalized Gloas column DB accumulates below quorum E=" & $envelopePresent & preset():
-      finalizedColumnsFixture:
+      finalizedColumnsFixture(true):
         if envelopePresent:
           require (await processor.addPayload(engine.blck, engine.envelope,
             Opt.none(gloas.DataColumnSidecars))).isOk
@@ -823,7 +906,7 @@ suite "Block processor" & preset():
           check wake == bid.slot
 
   asyncTest "Finalized Gloas invalid column batch has zero writes or wakeup" & preset():
-    finalizedColumnsFixture:
+    finalizedColumnsFixture(true):
       var wakes: seq[Slot]
       processor.onDataColumnsStored = proc(slot: Slot) = wakes.add(slot)
       for kind in 0..6:
@@ -848,7 +931,7 @@ suite "Block processor" & preset():
 
   for envelopePresent in [false, true]:
     asyncTest "Finalized Gloas invalid envelope zero writes E=" & $envelopePresent & preset():
-      finalizedColumnsFixture:
+      finalizedColumnsFixture(true):
         if envelopePresent:
           require (await processor.addPayload(engine.blck, engine.envelope,
             Opt.none(gloas.DataColumnSidecars))).isOk
@@ -876,7 +959,7 @@ suite "Block processor" & preset():
             check SSZ.encode(db.getExecutionPayloadEnvelope(bid.root).get()) == saved
 
   asyncTest "Finalized Gloas self-build bad signature is Invalid before Duplicate" & preset():
-    finalizedColumnsFixture:
+    finalizedColumnsFixture(true):
       var bad = copyFixture(engine.envelope)
       bad.signature = default(ValidatorSig)
       for envelopePresent in [false, true]:
@@ -890,7 +973,7 @@ suite "Block processor" & preset():
           not db.containsDataColumnSidecar(ConsensusFork.Gloas, bid.root, ColumnIndex(0))
 
   asyncTest "Finalized Gloas missed slot alias is refused exactly" & preset():
-    finalizedColumnsFixture:
+    finalizedColumnsFixture(true):
       dag.finalizedHead.slot = bid.slot + 1
       var bad = copyFixture(engine.envelope)
       bad.message.payload.slot_number = bid.slot + 1
@@ -902,7 +985,7 @@ suite "Block processor" & preset():
         not db.containsDataColumnSidecar(ConsensusFork.Gloas, bid.root, ColumnIndex(0))
 
   asyncTest "Finalized Gloas mismatched canonical block-envelope pair has zero writes" & preset():
-    finalizedColumnsFixture:
+    finalizedColumnsFixture(true):
       process_slots(cfg, state[], bid.slot + 1, cache, info, {}).expect("next fixture slot")
       let other = addTestEngineBlock(cfg, ConsensusFork.Gloas, forkyState,
         cache, blobs_bundle = engine.blobsBundle)
@@ -920,7 +1003,7 @@ suite "Block processor" & preset():
       check dag.addBackfillExecutionPayload(other.envelope).isOk
 
   asyncTest "Finalized Gloas conflicting stored envelope and columns are preserved" & preset():
-    finalizedColumnsFixture:
+    finalizedColumnsFixture(true):
       var conflicting = copyFixture(engine.envelope)
       conflicting.message.payload.gas_used += 1
       db.putExecutionPayloadEnvelope(conflicting)
@@ -946,7 +1029,7 @@ suite "Block processor" & preset():
       check SSZ.encode(stored) == savedColumn
 
   asyncTest "Finalized Gloas builder signature refusal obeys strict reassignment epoch" & preset():
-    finalizedColumnsFixture:
+    finalizedColumnsFixture(true):
       # Model a stored finalized external-builder block with native signatures.
       # This fixture targets historical import, not a replayed finality chain.
       var historical = copyFixture(engine.blck)
@@ -998,6 +1081,292 @@ suite "Block processor" & preset():
       check:
         refused.isErr and refused.error == PayloadVerifierError.LocalVerification
         SSZ.encode(db.getExecutionPayloadEnvelope(historical.root).get()) == saved
+
+  asyncTest "Historical work gates undecidable and EMPTY without any network" & preset():
+    finalizedColumnsFixture(true):
+      let overseer = SyncOverseerRef2(consensusManager: consensusManager,
+        blockProcessor: processor)
+      check dag.historicalPayloadStatus(bid) == HistoricalPayloadStatus.Undecidable
+      overseer.notifyHistoricalPayload(bid, supernodeMap)
+      check overseer.historicalPayload.isNone()
+      process_slots(cfg, state[], bid.slot + 3, cache, info, {}).expect("missed slots")
+      let emptyChild = addTestEngineBlock(cfg, ConsensusFork.Gloas,
+        forkyState, cache, should_extend_payload = false)
+      require (await processor.addBlock(MsgSource.sync, emptyChild.blck, noSidecars)).isOk
+      dag.updateHead(dag.getBlockRef(emptyChild.blck.root).get(), quarantine[], [])
+      dag.finalizedHead = BlockSlot(blck: dag.head, slot: emptyChild.blck.message.slot)
+      db.finalizedBlocks.insert(bid.slot, bid.root)
+      db.finalizedBlocks.insert(emptyChild.blck.message.slot, emptyChild.blck.root)
+      check dag.historicalPayloadStatus(bid) == HistoricalPayloadStatus.Empty
+      overseer.notifyHistoricalPayload(bid, supernodeMap)
+      check overseer.historicalPayload.isNone()
+
+  asyncTest "Historical FULL lookup and bounded coalescing leave normal sync unchanged" & preset():
+    finalizedColumnsFixture(true):
+      prepareHistoricalFixture()
+      check dag.historicalPayloadStatus(bid) == HistoricalPayloadStatus.Full
+      let oldHead = dag.head.root
+      var normalVerifications = 0
+      proc normalVerifier(item: SyncResponseItem, finalized: bool):
+          Future[Result[void, SyncVerifierError]] {.async: (raises: [CancelledError]).} =
+        inc normalVerifications
+        return ok()
+      let
+        forkAt = proc(epoch: Epoch): ConsensusFork = ConsensusFork.Gloas
+        peerCount = proc(): int = 1
+      overseer.fqueue = SyncQueue.init(Peer, BlockCompleteness,
+        SyncQueueKind.Forward, Slot(1), Slot(80), 1'u64, 3, 2,
+        getSlot, normalVerifier, forkAt, peerCount)
+      let cursors = (overseer.fqueue.inpSlot, overseer.fqueue.outSlot)
+      overseer.notifyHistoricalPayload(bid, custody)
+      require overseer.historicalPayload.isSome()
+      check overseer.historicalPayload.get().frontier
+      for i in 0..15: overseer.notifyHistoricalPayload(bid, custody)
+      check overseer.historicalPayload.get().bid == bid
+      let nestedPeer = HistoricalTestPeer(checkpoint: peer.checkpoint,
+        columnsMap: supernodeMap, score: 1000)
+      let nestedEntry = PeerEntryRef[HistoricalTestPeer](peer: nestedPeer,
+        maxEnvelopesPerRequest: 1, maxSidecarsPerRequest: 32)
+      var nested: Future[bool].Raising([CancelledError])
+      peer.onRequest = proc() =
+        overseer.notifyHistoricalPayload(bid, custody)
+        nested = overseer.doHistoricalPayloadStep(nestedPeer, nestedEntry, getCustody, getSlot)
+      check (await overseer.doHistoricalPayloadStep(peer, peerEntry, getCustody, getSlot))
+      require nested != nil
+      check (await nested)
+      check:
+        nestedPeer.envelopeCalls == 0 and nestedPeer.columnCalls == 0
+        peer.envelopeCalls == 1 and peer.columnCalls == 1
+        peer.maximum == 32
+        dag.head.root == oldHead
+        overseer.sdag.roots.len == 0
+        not overseer.historicalPayload.get().busy
+        db.containsExecutionPayloadEnvelope(bid.root)
+        (overseer.fqueue.inpSlot, overseer.fqueue.outSlot) == cursors
+        normalVerifications == 0
+
+  asyncTest "Historical frontier item replaces E-only work without growing a queue" & preset():
+    finalizedColumnsFixture(true):
+      prepareHistoricalFixture()
+      db.putDataColumnSidecars(columns)
+      overseer.notifyHistoricalPayload(bid, custody)
+      require overseer.historicalPayload.isSome()
+      check not overseer.historicalPayload.get().frontier
+      process_slots(cfg, state[], child.blck.message.slot + 1,
+        cache, info, {}).expect("grandchild slot")
+      let grandchild = addTestEngineBlock(cfg, ConsensusFork.Gloas,
+        forkyState, cache, blobs_bundle = engine.blobsBundle)
+      require (await processor.addBlock(MsgSource.sync, grandchild.blck, noSidecars)).isOk
+      dag.updateHead(dag.getBlockRef(grandchild.blck.root).get(), quarantine[], [])
+      dag.finalizedHead = BlockSlot(blck: dag.head, slot: grandchild.blck.message.slot)
+      db.finalizedBlocks.insert(grandchild.blck.message.slot, grandchild.blck.root)
+      let next = child.blck.toBlockId()
+      require dag.historicalPayloadStatus(next) == HistoricalPayloadStatus.Full
+      overseer.notifyHistoricalPayload(next, custody)
+      check:
+        overseer.historicalPayload.get().bid == next
+        overseer.historicalPayload.get().frontier
+      for i in 0..15: overseer.notifyHistoricalPayload(bid, custody)
+      check overseer.historicalPayload.get().bid == next
+      # No pending-item journal: restart loses the dropped E-only notice.
+      let restarted = SyncOverseerRef2(consensusManager: consensusManager,
+        blockProcessor: processor)
+      check restarted.historicalPayload.isNone()
+      restarted.notifyHistoricalPayload(bid, custody)
+      check restarted.historicalPayload.get().bid == bid
+
+  asyncTest "Historical DB partial batches survive worker restart independently of envelope" & preset():
+    finalizedColumnsFixture(true):
+      prepareHistoricalFixture()
+      peer.envelopes = @[]
+      overseer.notifyHistoricalPayload(bid, custody)
+      require (await overseer.doHistoricalPayloadStep(peer, peerEntry, getCustody, getSlot))
+      check:
+        db.containsDataColumnSidecar(ConsensusFork.Gloas, bid.root, ColumnIndex(31))
+        not db.containsDataColumnSidecar(ConsensusFork.Gloas, bid.root, ColumnIndex(32))
+        not db.containsExecutionPayloadEnvelope(bid.root)
+      let restarted = SyncOverseerRef2(consensusManager: consensusManager,
+        blockProcessor: processor, config: default(BeaconNodeConf))
+      let backfiller = ColumnReconstructionBackfillerRef.new(dag, nil, taskpool)
+      backfiller.onMissingData = proc(found: BlockId) =
+        restarted.notifyHistoricalPayload(found, custody)
+      discard await backfiller.processSlot(bid.slot)
+      require restarted.historicalPayload.isSome()
+      for i in 0..2:
+        require (await restarted.doHistoricalPayloadStep(peer, peerEntry, getCustody, getSlot))
+      check:
+        db.containsDataColumnSidecar(ConsensusFork.Gloas, bid.root, ColumnIndex(127))
+        not db.containsExecutionPayloadEnvelope(bid.root)
+        not restarted.historicalPayload.get().frontier
+      peer.columnsMap = ColumnMap()
+      peer.envelopes = @[newClone(engine.envelope)]
+      let oldCalls = peer.columnCalls
+      require (await restarted.doHistoricalPayloadStep(peer, peerEntry, getCustody, getSlot))
+      check:
+        db.containsExecutionPayloadEnvelope(bid.root)
+        peer.columnCalls == oldCalls
+        restarted.historicalPayload.isNone()
+
+  asyncTest "Historical E-only producer fires before Servable128" & preset():
+    finalizedColumnsFixture(true):
+      prepareHistoricalFixture()
+      db.putDataColumnSidecars(columns)
+      let backfiller = ColumnReconstructionBackfillerRef.new(dag, nil, taskpool)
+      var observed = 0
+      backfiller.onMissingData = proc(found: BlockId) =
+        inc observed
+        overseer.notifyHistoricalPayload(found, custody)
+      discard await backfiller.processSlot(bid.slot)
+      check observed == 1 and overseer.historicalPayload.isSome()
+      peer.columnsMap = ColumnMap()
+      peer.earliest = Opt.some(bid.slot + 1)
+      require (await overseer.doHistoricalPayloadStep(peer, peerEntry, getCustody, getSlot))
+      check peer.envelopeCalls == 1 and peer.columnCalls == 0
+      check overseer.historicalPayload.isNone()
+
+  asyncTest "Historical FULL zero commitments request only the envelope" & preset():
+    finalizedColumnsFixture(false):
+      process_slots(cfg, state[], bid.slot + 1, cache, info, {}).expect("empty blob child")
+      let child = addTestEngineBlock(cfg, ConsensusFork.Gloas, forkyState, cache)
+      require (await processor.addBlock(MsgSource.sync, child.blck, noSidecars)).isOk
+      dag.updateHead(dag.getBlockRef(child.blck.root).get(), quarantine[], [])
+      dag.finalizedHead = BlockSlot(blck: dag.head, slot: child.blck.message.slot)
+      db.finalizedBlocks.insert(bid.slot, bid.root)
+      let o = SyncOverseerRef2(consensusManager: consensusManager, blockProcessor: processor)
+      let p = HistoricalTestPeer(checkpoint: Checkpoint(epoch: bid.slot.epoch + 1),
+        earliest: Opt.some(bid.slot + 1), envelopes: @[newClone(engine.envelope)])
+      let entry = PeerEntryRef[HistoricalTestPeer](peer: p, maxEnvelopesPerRequest: 1)
+      let getMap = proc(): ColumnMap = supernodeMap
+      let getTime = proc(): Slot = child.blck.message.slot
+      o.notifyHistoricalPayload(bid, supernodeMap)
+      require (await o.doHistoricalPayloadStep(p, entry, getMap, getTime))
+      check p.envelopeCalls == 1 and p.columnCalls == 0
+      check o.historicalPayload.isNone()
+
+  asyncTest "Historical ineligible peer and timeout preserve work with bounded retry" & preset():
+    finalizedColumnsFixture(true):
+      prepareHistoricalFixture()
+      peer.earliest = Opt.some(bid.slot + 1)
+      peerEntry.maxEnvelopesPerRequest = 0
+      overseer.notifyHistoricalPayload(bid, custody)
+      require (await overseer.doHistoricalPayloadStep(peer, peerEntry, getCustody, getSlot))
+      check peer.envelopeCalls == 0 and peer.columnCalls == 0
+      check not overseer.historicalPayload.get().busy
+      peer.earliest = Opt.none(Slot)
+      peerEntry.maxEnvelopesPerRequest = 1
+      peer.envelopeFailure = Opt.some(Eth2NetworkingError(kind: ReadResponseTimeout))
+      check not (await overseer.doHistoricalPayloadStep(peer, peerEntry, getCustody, getSlot))
+      check:
+        peer.envelopeCalls == 1 and peer.columnCalls == 0
+        not db.containsExecutionPayloadEnvelope(bid.root)
+        overseer.historicalPayload.isSome()
+      require (await overseer.doHistoricalPayloadStep(peer, peerEntry, getCustody, getSlot))
+      check peer.envelopeCalls == 1
+      clock += 1
+      let scoreAfterTimeout = peer.score
+      peer.envelopeFailure = Opt.some(Eth2NetworkingError(
+        kind: ReceivedErrorResponse, responseCode: ResourceUnavailable,
+        errorMsg: "generated fixture"))
+      require (await overseer.doHistoricalPayloadStep(peer, peerEntry, getCustody, getSlot))
+      check:
+        peer.envelopeCalls == 2
+        peer.score == scoreAfterTimeout + PeerScoreGoodValues
+        not db.containsExecutionPayloadEnvelope(bid.root)
+        db.containsDataColumnSidecar(ConsensusFork.Gloas, bid.root, ColumnIndex(31))
+      clock += 1
+      peer.envelopeFailure = Opt.none(Eth2NetworkingError)
+      require (await overseer.doHistoricalPayloadStep(peer, peerEntry, getCustody, getSlot))
+      check peer.envelopeCalls == 3
+      let calls = peer.columnCalls
+      peer.columnsMap = ColumnMap()
+      require (await overseer.doHistoricalPayloadStep(peer, peerEntry, getCustody, getSlot))
+      check peer.columnCalls == calls
+      let envelopeCalls = peer.envelopeCalls
+      clock = (bid.slot.epoch + max(cfg.MIN_EPOCHS_FOR_BLOCK_REQUESTS,
+        cfg.MIN_EPOCHS_FOR_DATA_COLUMN_SIDECARS_REQUESTS) + 1).start_slot()
+      require (await overseer.doHistoricalPayloadStep(peer, peerEntry, getCustody, getSlot))
+      check:
+        peer.envelopeCalls == envelopeCalls and peer.columnCalls == calls
+        overseer.historicalPayload.isNone()
+
+  asyncTest "Historical invalid envelope and column responses write no unverified data" & preset():
+    finalizedColumnsFixture(true):
+      prepareHistoricalFixture()
+      for kind in 0..2:
+        clock += 1
+        var bad = copyFixture(engine.envelope)
+        if kind == 0: bad.message.beacon_block_root = ZERO_HASH
+        if kind == 1: bad.signature = default(ValidatorSig)
+        peer.envelopes =
+          if kind == 2: @[newClone(engine.envelope), newClone(engine.envelope)]
+          else: @[newClone(bad)]
+        overseer.notifyHistoricalPayload(bid, custody)
+        check not (await overseer.doHistoricalPayloadStep(peer, peerEntry, getCustody, getSlot))
+        check:
+          not db.containsExecutionPayloadEnvelope(bid.root)
+          not db.containsDataColumnSidecar(ConsensusFork.Gloas, bid.root, ColumnIndex(0))
+          peer.columnCalls == 0
+      require dag.addBackfillExecutionPayload(engine.envelope).isOk
+      let saved = SSZ.encode(db.getExecutionPayloadEnvelope(bid.root).get())
+      for kind in 0..4:
+        clock += 1
+        var column = newClone(copyFixture(columns[1][]))
+        case kind
+        of 0: column.slot = bid.slot + 1
+        of 1: column.beacon_block_root = ZERO_HASH
+        of 2: column.index = ColumnIndex(NUMBER_OF_COLUMNS)
+        of 3: column.kzg_proofs[0] = default(typeof(column.kzg_proofs[0]))
+        else: column.index = ColumnIndex(0)
+        peer.columns = @[columns[0], column]
+        peer.allColumns = true
+        overseer.notifyHistoricalPayload(bid, custody)
+        check not (await overseer.doHistoricalPayloadStep(peer, peerEntry, getCustody, getSlot))
+        check:
+          not db.containsDataColumnSidecar(ConsensusFork.Gloas, bid.root, ColumnIndex(0))
+          not db.containsDataColumnSidecar(ConsensusFork.Gloas, bid.root, ColumnIndex(1))
+          SSZ.encode(db.getExecutionPayloadEnvelope(bid.root).get()) == saved
+
+  asyncTest "Historical valid envelope commit survives later invalid column response" & preset():
+    finalizedColumnsFixture(true):
+      prepareHistoricalFixture()
+      var bad = newClone(copyFixture(columns[0][]))
+      bad.kzg_proofs[0] = default(typeof(bad.kzg_proofs[0]))
+      peer.columns = @[bad]
+      peer.allColumns = true
+      overseer.notifyHistoricalPayload(bid, custody)
+      check not (await overseer.doHistoricalPayloadStep(peer, peerEntry, getCustody, getSlot))
+      check:
+        db.containsExecutionPayloadEnvelope(bid.root)
+        not db.containsDataColumnSidecar(ConsensusFork.Gloas, bid.root, ColumnIndex(0))
+      # Each RPC batch commits separately; an invalid C batch cannot undo the
+      # preceding valid E commit. A fresh worker resumes C without replaying E.
+      let restarted = SyncOverseerRef2(consensusManager: consensusManager,
+        blockProcessor: processor)
+      peer.columns = columns
+      peer.allColumns = false
+      let before = peer.envelopeCalls
+      restarted.notifyHistoricalPayload(bid, custody)
+      require (await restarted.doHistoricalPayloadStep(peer, peerEntry, getCustody, getSlot))
+      check:
+        peer.envelopeCalls == before
+        db.containsDataColumnSidecar(ConsensusFork.Gloas, bid.root, ColumnIndex(31))
+
+  asyncTest "Historical local DB conflict preserves bytes without blaming peer" & preset():
+    finalizedColumnsFixture(true):
+      prepareHistoricalFixture()
+      require dag.addBackfillExecutionPayload(engine.envelope).isOk
+      var conflicting = newClone(copyFixture(columns[0][]))
+      conflicting.slot = bid.slot + 1
+      peer.onRequest = proc() = db.putDataColumnSidecars(@[conflicting])
+      overseer.notifyHistoricalPayload(bid, custody)
+      require (await overseer.doHistoricalPayloadStep(peer, peerEntry, getCustody, getSlot))
+      var saved: gloas.DataColumnSidecar
+      check:
+        peer.score == 1000
+        not db.containsDataColumnSidecar(ConsensusFork.Gloas, bid.root, ColumnIndex(1))
+        db.getDataColumnSidecar(bid.root, ColumnIndex(0), saved)
+        saved.slot == conflicting.slot
+        overseer.historicalPayload.isSome()
 
 # Clean up KZG trusted setup at the end of all tests
 doAssert kzg.freeTrustedSetup().isOk

@@ -730,6 +730,10 @@ proc initFullNode(
     blockProcessor.onDataColumnsStored =
       proc(slot: Slot) {.gcsafe, raises: [].} =
         backfiller.onColumnsStored(slot)
+    let overseer = node.syncOverseer
+    backfiller.onMissingData =
+      proc(bid: BlockId) {.gcsafe, raises: [].} =
+        overseer.notifyHistoricalPayload(bid, validatorCustody.getMap())
 
   node.router = router
 

@@ -33,6 +33,13 @@ type
     stamp*: chronos.Moment
     slots*: uint64
 
+  HistoricalPayloadWork* = object
+    ## One bounded historical item, not a sync cursor or persistent queue.
+    bid*: BlockId
+    frontier*: bool
+    busy*: bool
+    attemptedAt*: Opt[Slot]
+
   SyncOverseer2* = object
     network*: Eth2Node
     consensusManager*: ref ConsensusManager
@@ -68,6 +75,7 @@ type
     statusMessages*: array[2, string]
     sdag*: SyncDag[Peer, PeerId]
     eraBid*: Opt[BlockId]
+    historicalPayload*: Opt[HistoricalPayloadWork]
 
   SyncOverseerRef2* = ref SyncOverseer2
 
