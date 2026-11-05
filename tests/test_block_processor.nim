@@ -1163,8 +1163,11 @@ suite "Block processor" & preset():
       descendant.signature = get_block_signature(forkyState.data.fork,
         dag.genesis_validators_root, descendant.message.slot, descendant.root,
         MockPrivKeys[descendant.message.proposer_index]).toValidatorSig()
-      db.putBlock(ForkedSignedBeaconBlock.init(historical).asTrusted().gloasData)
-      db.putBlock(ForkedSignedBeaconBlock.init(descendant).asTrusted().gloasData)
+      let
+        forkedHistorical = ForkedSignedBeaconBlock.init(historical)
+        forkedDescendant = ForkedSignedBeaconBlock.init(descendant)
+      db.putBlock(forkedHistorical.asTrusted().gloasData)
+      db.putBlock(forkedDescendant.asTrusted().gloasData)
       db.finalizedBlocks.insert(bid.slot, historical.root)
       db.finalizedBlocks.insert(descendant.message.slot, descendant.root)
       dag.head = BlockRef.init(descendant.root, OptimisticStatus.valid, descendant.message)
