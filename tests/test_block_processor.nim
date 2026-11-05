@@ -887,6 +887,7 @@ suite "Block processor" & preset():
 
   asyncTest "Finalized Gloas mismatched canonical block-envelope pair has zero writes" & preset():
     finalizedColumnsFixture:
+      process_slots(cfg, state[], bid.slot + 1, cache, info, {}).expect("next fixture slot")
       let other = addTestEngineBlock(cfg, ConsensusFork.Gloas, forkyState,
         cache, blobs_bundle = engine.blobsBundle)
       require (await processor.addBlock(MsgSource.sync, other.blck, noSidecars)).isOk
